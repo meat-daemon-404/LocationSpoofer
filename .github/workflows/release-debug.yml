@@ -1,0 +1,117 @@
+name: Debug-signed Prerelease
+
+# 没有正式签名密钥时，用手动触发这条流水线产出一个可直接安装的预发布包。
+# 产物用 debug 签名，因此标记为 prerelease：应用内需要在设置里打开「检查测试版更新」才会看到。
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: '发布用的 tag（留空则取 v<gradle.properties 里的 APP_VERSION_NAME>）'
+        required: false
+        default: ''
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-debug-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build-and-release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Resolve version and tag
+        id: ver
+        run: |
+          VERSION_NAME=$(grep '^APP_VERSION_NAME=' gradle.properties | head -n 1 | cut -d'=' -f2)
+          TAG="${{ inputs.tag }}"
+          if [ -z "$TAG" ]; then TAG="v$VERSION_NAME"; fi
+          echo "version_name=$VERSION_NAME" >> $GITHUB_OUTPUT
+          echo "tag=$TAG" >> $GITHUB_OUTPUT
+          echo "本次发布版本: $VERSION_NAME  tag: $TAG"
+
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+          cache: 'gradle'
+
+      - name: Build debug APKs
+        run: |
+          chmod +x ./gradlew
+          # 两种模拟方案分开打包：同一次调用里并行打包多个变体 × ABI 拆分时，
+          # AGP 的签名摘要任务会和打包写文件任务抢 ForkJoinPool 而互相死锁。
+          ./gradlew --no-daemon :app:assembleScopedDebug
+          ./gradlew --no-daemon :app:assembleGlobalDebug
+
+      - name: Collect and rename APKs
+        run: |
+          TAG="${{ steps.ver.outputs.tag }}"
+          DIST_DIR="app/build/outputs/apk/dist"
+          mkdir -p "$DIST_DIR"
+          for SCHEME in scoped global; do
+            APK_DIR="app/build/outputs/apk/$SCHEME/debug"
+            find "$APK_DIR" -name "*.apk" -print0 | while IFS= read -r -d '' file; do
+              BASENAME=$(basename "$file")
+              if [[ "$BASENAME" == *"arm64-v8a"* ]]; then
+                mv "$file" "$DIST_DIR/LocationSpoofer-$SCHEME-arm64-v8a-$TAG.apk"
+              elif [[ "$BASENAME" == *"armeabi-v7a"* ]]; then
+                mv "$file" "$DIST_DIR/LocationSpoofer-$SCHEME-armeabi-v7a-$TAG.apk"
+              else
+                mv "$file" "$DIST_DIR/LocationSpoofer-$SCHEME-$TAG.apk"
+              fi
+            done
+          done
+          ls -l "$DIST_DIR"
+          COUNT=$(find "$DIST_DIR" -name "LocationSpoofer-*.apk" | wc -l)
+          if [ "$COUNT" -ne 4 ]; then
+            echo "错误：预期 4 个安装包（scoped/global × arm64-v8a/armeabi-v7a），实际 $COUNT 个，终止发布。"
+            exit 1
+          fi
+
+      - name: Generate release notes
+        run: |
+          TAG="${{ steps.ver.outputs.tag }}"
+          PREV_TAG=$(git describe --tags --abbrev=0 2>/dev/null || echo "")
+          if [ -z "$PREV_TAG" ]; then
+            COMMITS=$(git log --no-merges --pretty=format:"%s" | head -n 40)
+          else
+            COMMITS=$(git log "$PREV_TAG"..HEAD --no-merges --pretty=format:"%s")
+          fi
+
+          {
+            echo "## 构建说明"
+            echo ""
+            echo "- 本包使用 **debug 签名** 构建：仓库尚未配置正式签名密钥，正式发版流水线会自动跳过。"
+            echo "- 与已安装版本签名不同，安装前需要先卸载旧版（应用数据会被清除）。"
+            echo "- 这是一个预发布版本，应用内需在设置中打开「检查测试版更新」才会看到。"
+            echo "- 安装包：\`-scoped-\` 为按作用域 Hook 目标应用的方案，\`-global-\` 为全局方案，两者二选一。"
+            echo ""
+            echo "## 变更"
+            echo ""
+            FEATS=$(echo "$COMMITS" | grep "^feat:" | sed 's/^feat:[[:space:]]*/- /' || true)
+            FIXES=$(echo "$COMMITS" | grep "^fix:" | sed 's/^fix:[[:space:]]*/- /' || true)
+            OTHERS=$(echo "$COMMITS" | grep -vE "^(feat|fix):" | sed 's/^/- /' || true)
+            if [ -n "$FEATS" ]; then echo "### 功能"; echo "$FEATS"; echo ""; fi
+            if [ -n "$FIXES" ]; then echo "### 修复"; echo "$FIXES"; echo ""; fi
+            if [ -n "$OTHERS" ]; then echo "### 其它"; echo "$OTHERS"; echo ""; fi
+          } > release-notes.md
+          cat release-notes.md
+
+      - name: Publish prerelease
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.ver.outputs.tag }}
+          name: LocationSpoofer ${{ steps.ver.outputs.tag }}
+          body_path: release-notes.md
+          prerelease: true
+          files: app/build/outputs/apk/dist/LocationSpoofer-*.apk
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

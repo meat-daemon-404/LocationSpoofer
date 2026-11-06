@@ -140,8 +140,24 @@ jobs:
 
           cat changelog.txt
           
-      - name: Setup Java
+      - name: Check signing secrets
         if: steps.check_version.outputs.changed == 'true'
+        id: signing
+        env:
+          KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
+        run: |
+          # 没有签名密钥时不要硬着头皮构建：release 变体固定使用 release 签名配置，
+          # 空密钥会让 apksigner 报错，把整条发版流水线染红。
+          if [ -z "$KEYSTORE_BASE64" ]; then
+            echo "未配置签名密钥（KEYSTORE_BASE64 / KEYSTORE_PASSWORD / KEY_ALIAS / KEY_PASSWORD），跳过正式发版。"
+            echo "需要立刻可安装的包，请手动触发 .github/workflows/release-debug.yml（debug 签名）。"
+            echo "ready=false" >> $GITHUB_OUTPUT
+          else
+            echo "ready=true" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Setup Java
+        if: steps.check_version.outputs.changed == 'true' && steps.signing.outputs.ready == 'true'
         uses: actions/setup-java@v4
         with:
           distribution: 'temurin'
@@ -149,14 +165,14 @@ jobs:
           cache: 'gradle'
 
       - name: Decode Keystore
-        if: steps.check_version.outputs.changed == 'true'
+        if: steps.check_version.outputs.changed == 'true' && steps.signing.outputs.ready == 'true'
         env:
           ENCODED_KEYSTORE: ${{ secrets.KEYSTORE_BASE64 }}
         run: |
           echo $ENCODED_KEYSTORE | base64 -d > $RUNNER_TEMP/keystore.jks
 
       - name: Build Release APK
-        if: steps.check_version.outputs.changed == 'true'
+        if: steps.check_version.outputs.changed == 'true' && steps.signing.outputs.ready == 'true'
         env:
           KEYSTORE_FILE_PATH: ${{ runner.temp }}/keystore.jks
           KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
@@ -198,7 +214,7 @@ jobs:
           fi
 
       - name: Publish GitHub Release
-        if: steps.check_version.outputs.changed == 'true'
+        if: steps.check_version.outputs.changed == 'true' && steps.signing.outputs.ready == 'true'
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ steps.check_version.outputs.tag }}

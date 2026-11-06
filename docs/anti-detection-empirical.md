@@ -12,6 +12,8 @@
 > 落地状态：§1、§2、§3、§4.1、§4.2、§4.3、§4.5、§4.6、§4.7、§4.8、§4.9、§5、§6 已全部实现，全量编译通过，
 > `core-geo` 单元测试 64 项 + `xposed` 29 项全绿；另有 §4.4 两条已知边界未改
 > （基准海拔缺省值与静止位置精确，都需要产品决策）。
+> **已上机验证**（Android 15 x86_64 模拟器，LSPosed 注入目标进程、十五项改动在设备上被真实求值），
+> 过程中抓到并修掉两个只在真机暴露的 `Chain.args` 不可变问题，详见 §12；仍未走通的是「有 root 的端到端链路」。
 > 验证边界见文末「本次改动的验证边界」。
 
 ---
@@ -526,6 +528,22 @@ $GPGSA,A,3,07,09,11,14,19,21,,,,,,,1.8,0.9,1.6*35
 * 分星座颗数 **加起来恒等于整份天空**，所以 `GGA` 的「参与解算颗数」不可能超过 `GSV` 里能数出来的
   「在视野颗数」——单测在 5 个种子 × 3 个时刻上把这个划分性质钉住。
 
+#### 上机验收
+
+监听器替换是本节的**前置条件**：proxy 没挂上，一条报文都不会被重建。上机时这里先出过一次事——
+`LocationProviderHooker` 里写的是 `val args = chain.args`（别名）再 `args[i] = proxy`，而
+`Chain.getArgs()` 在 Android 15 上返回不可变 List，于是 `UnsupportedOperationException` 被框架吞掉，
+监听器换不上去、这一节等于没生效（细节见 §12.5）。改成 `ArrayList<Any?>(chain.args)` 后复验：
+
+```
+UnsupportedOperationException 计数 = 0
+Exception in hooker 计数 = 0
+I LocationSpoofer: [GPS_Spoofer] Detected addNmeaListener(OnNmeaMessageListener)! Starting active injector.   ← 出现 2 次
+```
+
+仍未验证的是**目标应用侧**：它的 NMEA 监听器收到的到底是不是这几行，需要应用自己把报文打出来才看得见，
+本轮没有做（见 §12.6）。
+
 #### 诚实边界
 
 * 只改写了真机**实际发出**的报文；真机连 `GGA`/`GSV` 都不发（只用融合定位、不开放 NMEA）时，这条通道无事可做。
@@ -672,7 +690,7 @@ nextDispatchMs += dispatchPeriodMs
 
 - 用 `kotlin-compiler-embeddable 2.0.0` 直接以命令行编译两个模块的全部 73 个 Kotlin 源文件
   加 1 份 `BuildConfig` 桩（classpath = `android-34/android.jar` + libxposed API jar），
-  产出 372 个 class，**退出码 0、无错误**。
+  产出 373 个 class，**退出码 0、无错误**。
 - `core-geo` 用到的 `BuildConfig` 需要一份桩（真 BuildConfig 由 flavor 生成），
   桩只要 `const val GLOBAL_SCHEME: Boolean`。
 - `app-ui` / `core-data` / `service` 三个模块的 Compose、高德/百度 Maps 依赖在本机拿不到，
@@ -761,22 +779,28 @@ nextDispatchMs += dispatchPeriodMs
 - 这一节证明的是「报文本身合法、内部自洽、不是真机那份」，**不证明目标应用真的会走这条通道**——
   多数应用直接用 `Location`/`GnssStatus`，只有解析 NMEA 的才看得到。
 
-**⑨ 上机（模拟器：模块注入与配置通道，详见 §12）**
+**⑨ 上机（模拟器：模块注入 + DEBUG 兜底 + 派发侧日志，详见 §12）**
 
 - debug 包（`assembleScopedDebug`，`versionName 3.0.21-beta-3`，arm64-v8a）装进 Android 15 x86_64 模拟器，
   启动正常；LSPosed 启用模块并把 `com.autonavi.minimap` 加进作用域后，目标进程日志里出现
   `[INJECTED] Hooking package`、`Anti-detection hooks installed`、`GnssStatus hooks installed`、
   `Wi-Fi environment hooks installed`——**Hook 确实装上了**。
-- 数值层面的对照没能在这一步完成：应用拿不到 root，配置快照无法发布（§12.3 有完整证据），
-  模块停在「没有 active 配置」的状态。为此加了 **DEBUG 构建专用**的兜底配置源与一条模型摊平日志（§12.4），
-  但这条路径本身还没跑通。
+- 应用拿不到 root，正式配置快照发布不出来（§12.3 有完整证据），因此加了 **DEBUG 构建专用**的兜底配置源
+  与一条模型摊平日志（§12.4）；这条兜底在设备上**跑通了**，日志里有：
+  `pos=… speed=0.00 alt=121.44 hPa=998.84 sat=20/21/17 ttff=1127 nmea=$GPGSV,2,1,07,…*7D`，
+  20 秒后同一文件重载给出 `alt=121.66 / hPa=998.78`——**十五项改动第一次在设备上被真实求值**。
+- 上机当场抓到并修掉两个 `Chain.args` 不可变问题（§12.5），修完后
+  `UnsupportedOperationException` 与 `Exception in hooker` 计数**归零**，
+  `[GPS_Spoofer] Detected addNmeaListener(...)` 出现两次（= §4.9 的 proxy 真的挂上了）。
+- 但**没有一条「目标应用真的读到我们的数值」的端到端证据**：应用内部读数取不到，
+  只验证了「我们派发了什么」。
 
 **仍然不能确定的是真机运行时行为**：反射构造 `SensorEvent` 的三条 fallback 路径、
 不同 ROM 下 `TYPE_STEP_DETECTOR` 的实际投递节奏、`Thread.sleep` 网格在真机上的实际抖动
 （§6 的 996/1004 ms 来自另一套独立实现的外部实测，不是本仓库测的）、
 虚拟 `TYPE_PRESSURE` 传感器能否被目标应用正常枚举、
 `removeMslAltitude` 在真机 Location 对象上的实际可用性（反射失败会静默跳过）、
-以及 ColorOS 16 适配路径的实机命中情况、§12.4 那条 DEBUG 兜底能否真的把配置喂进去。
+以及 ColorOS 16 适配路径的实机命中情况、有 root 的真机上「应用发布配置 → 模块收到快照」这条正式链路。
 
 
 上真机后建议按下面附录逐条量，并把结果回填到本文件。
@@ -863,16 +887,66 @@ W LSPosedFramework: 	at com.vincenthzr.locationspoofer.xposed.hooks.GnssStatusHo
 全仓扫过一遍，同样的写法还有一处：`AMapHooker` 的 `setMockEnable`。
 
 修法：新增扩展 `Chain.replaceArg(index, value)`——复制一份实参数组再 `proceed(patched)`，
-不碰上游的只读 List；两处都改用它。
+不碰框架给的只读 List；两处都改用它。
 
-这条是整轮里**唯一一个只有真机/模拟器能发现**的问题：编译过、单测全绿、
-纯函数数值对照也对，但它只在「真的有一个框架在回调你」的时候才暴露。
+**但第一版修完后异常并没有归零**，还剩两处，栈换成了另一条通道：
 
-### 12.6 这一步还没做完的事
+```
+W LSPosedFramework: java.lang.UnsupportedOperationException
+W LSPosedFramework: 	at java.util.Collections$UnmodifiableList.set(Collections.java:1548)
+W LSPosedFramework: 	at ...LocationProviderHookerKt$hookLocationProviders$...intercept
+W LSPosedFramework: 	at android.provider.Braistnt.addNmeaListener(Braistnt.java)
+```
 
-- 兜底路径本身没跑通验证（写 JSON → 重启目标进程 → 读回 `[DebugConfig]` 日志）；
-- 有 root 的真机链路（应用发布配置 → 模块收到快照 → 目标应用读到数值）完全没有走过；
-- 所以本轮结论仍然停在「编译 + 单测 + 纯函数数值对照 + 注入验证」这一层。
+`LocationProviderHooker` 里写的是 `val args = chain.args`（**别名**），再 `args[i] = proxy`。
+这条通道恰好就是本轮 §4.9 新增的 NMEA 重建入口——也就是说：**§4.9 的代码在真机上第一次跑，
+`addNmeaListener` 的监听器根本没被换成 proxy，一条 GSV/GSA 都没机会重建**。
+编译过、单测全绿、纯函数数值对照完全对，但它只在「真的有一个框架在回调你」的时候才暴露。
+
+修法：`val args = ArrayList<Any?>(chain.args)`，只动这一处；`proceed` 用 `args.toTypedArray()`。
+
+补一句踩坑记录：本想把这件事一次性解决——在 `XposedHelpers` 的 DSL 层包一个「实参可变」的
+`Chain` 实现，所有调用点自动受益。试了两种写法都过不了编译：
+
+- 直接 `class MutableArgsChain(private val delegate: Chain) : Chain` → 报
+  `does not implement abstract member 'proceedWith'`（`Array<out Any?>` / `Array<Any?>` / `vararg` 都报同一句）；
+- 改 `by delegate` 委托再覆盖属性 → 报 `'args' overrides nothing`（`args` / `executable` / `thisObject`
+  三个属性都无法显式覆盖）。
+
+libxposed API 102 的 `Chain` 在 Kotlin 里不接受这两种形态，于是放弃包装层，改为**逐个调用点修**，
+并用「按唯一上下文锚点替换 + 断言只命中一次」的脚本（`String.Replace` 会误伤同名的 12 处 `proceed`）。
+
+修完后在模拟器上复验（装的是修好后的 CI 产物）：
+
+```
+UnsupportedOperationException 计数 = 0
+Exception in hooker 计数 = 0
+I LocationSpoofer: [GPS_Spoofer] Detected addNmeaListener(OnNmeaMessageListener)! Starting active injector.   ← 两个监听器
+I LocationSpoofer: [DebugConfig] pos=...,... alt=121.44 hPa=998.84 sat=20/21/17 ttff=1127 nmea=$GPGSV,2,1,07,...*7D
+I LocationSpoofer: [getCellLocation:called:true:0] ... lat=...,... lng=...
+```
+
+⇒ NMEA 监听器这次真的被替换成功了（`Starting active injector` 出现两次，对应两个注册的监听器），
+§4.9 的 GSV/GSA 重建在真机上接通；海拔、气压、卫星三口径都随时间在变。
+
+### 12.6 这一步跑到哪儿了
+
+**已经跑通**：
+
+- 模块在 Android 15（x86_64 模拟器，ARM 转译）上装载、hook 目标进程（12.2）；
+- DEBUG 兜底读文件、把整轮模型摊平进一行日志（12.4）——**这是十五项改动第一次在设备上被求值**；
+- `Chain.args` 不可变这个真机专属 bug 修完并复验归零（12.5）；
+- 目标应用（高德地图）正常打开、不崩，定位按其读到的坐标落在配置的城市。
+
+**还没跑通**：
+
+- 有 root 的真机链路（应用发布配置 → 模块收到快照 → 目标应用读到数值）完全没走：
+  这版 MuMu 上 KernelSU 只有内核态没有 `su`，应用永远过不了自己的 root 门禁；
+- 因此上机验证用的是**调试兜底配置源**，不是正式通道；
+- 目标应用内部的数值（它到底读到多少颗卫星、海拔多少）没有取到——只验证了「我们派发了什么」，
+  没有验证「它收到了什么」。
+
+所以本轮的结论强度是：**「编译 + 单测 + 纯函数数值对照 + 注入验证 + 派发侧上机日志」，而不是端到端。**
 
 ---
 

@@ -312,7 +312,14 @@ private fun LocationHooker.startSystemLocationHeartbeat(classLoader: ClassLoader
                         }
                         val callback = info.listener
                         try {
-                            dispatchGnssStatus(callback, gnssStatus, classLoader, satCounts, satSeed)
+                            dispatchGnssStatus(
+                                callback,
+                                gnssStatus,
+                                classLoader,
+                                satCounts,
+                                satSeed,
+                                RouteEngine.realisticTimeToFirstFixMs(config)
+                            )
                         } catch (e: Throwable) {
                             if (!binder.isBinderAlive) {
                                 activeGnssStatusBinders.remove(binder)
@@ -353,7 +360,8 @@ private fun LocationHooker.dispatchGnssStatus(
     gnssStatus: Any?,
     classLoader: ClassLoader,
     counts: SatelliteModel.Counts = SatelliteModel.counts(20, 0L, System.currentTimeMillis()),
-    seed: Long = 0L
+    seed: Long = 0L,
+    ttffMs: Int = 1000
 ) {
     val clazz = listener.javaClass
 
@@ -362,7 +370,8 @@ private fun LocationHooker.dispatchGnssStatus(
         clazz.methods.firstOrNull { it.name == "onGnssStarted" && it.parameterCount == 0 }?.invoke(listener)
     } catch (_: Throwable) {}
     try {
-        clazz.methods.firstOrNull { it.name == "onFirstFix" && it.parameterCount == 1 }?.invoke(listener, 1000)
+        clazz.methods.firstOrNull { it.name == "onFirstFix" && it.parameterCount == 1 }
+            ?.invoke(listener, ttffMs)
     } catch (_: Throwable) {}
 
     val svMethod = clazz.methods.firstOrNull { it.name == "onSvStatusChanged" }
@@ -873,7 +882,14 @@ internal fun LocationHooker.hookSystemLocationService(classLoader: ClassLoader) 
                                         config.optBoolean("enable_jitter", true),
                                         null
                                     )
-                                    dispatchGnssStatus(callback, gnssStatus, classLoader, regCounts, regSeed)
+                                    dispatchGnssStatus(
+                                        callback,
+                                        gnssStatus,
+                                        classLoader,
+                                        regCounts,
+                                        regSeed,
+                                        RouteEngine.realisticTimeToFirstFixMs(config)
+                                    )
                                     hookGnssStatusListenerCallback(callback)
 
                                     logLoc("[SysLoc] Registered & dispatched target GNSS status callback for $pkgName (active: ${activeGnssStatusBinders.size})"

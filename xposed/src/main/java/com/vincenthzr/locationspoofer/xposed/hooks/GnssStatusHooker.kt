@@ -197,6 +197,14 @@ internal fun LocationHooker.hookGnssStatus(classLoader: ClassLoader) {
                                 config.optLong("start_timestamp", 0L)
                             )
                             XposedHelpers.setObjectField(statusObj, "mSatellites", satellites)
+                            // TTFF（首个 fix 耗时）也是要跟着会话走的量，不能留给框架填真实值
+                            try {
+                                XposedHelpers.setIntField(
+                                    statusObj,
+                                    "mTimeToFirstFix",
+                                    RouteEngine.realisticTimeToFirstFixMs(config)
+                                )
+                            } catch (_: Throwable) {}
                         } catch (_: Throwable) {}
                     }
                 }

@@ -248,4 +248,25 @@ class RouteEngineTest {
         }
         assertTrue(fixed.max() - fixed.min() <= 1.0)
     }
+
+    @Test
+    fun `time to first fix is stable per session and differs across sessions`() {
+        fun cfg(start: Long) = JSONObject().apply { put("start_timestamp", start) }
+
+        // 同一场次内必须是同一个值：真机 TTFF 在一次会话里不会来回跳
+        val one = RouteEngine.realisticTimeToFirstFixMs(cfg(1_700_000_000_000L))
+        repeat(5) { assertEquals(one, RouteEngine.realisticTimeToFirstFixMs(cfg(1_700_000_000_000L))) }
+
+        // 必须落在真机的量级里（热启动几百毫秒到冷启动几秒）
+        assertTrue(one in 700..2999)
+
+        // 不同场次不能全是同一个数——原来写死 1000 就是这个毛病
+        val distinct = (0 until 40)
+            .map { RouteEngine.realisticTimeToFirstFixMs(cfg(1_700_000_000_000L + it * 86_400_000L)) }
+            .toSet()
+        assertTrue(distinct.size >= 10)
+
+        // 缺配置时也要给出一个合法值，而不是 0 或 -1
+        assertTrue(RouteEngine.realisticTimeToFirstFixMs(JSONObject()) in 700..2999)
+    }
 }

@@ -1,4 +1,4 @@
-# 反检测实测提要
+﻿# 反检测实测提要
 
 本文不是设计文档，是把一个**已经跑了几十场、并被真实判定链路处理过**的模拟定位场景里，
 用落盘数据能直接量出来的东西，逐条对到本仓库的代码上。
@@ -9,8 +9,8 @@
 
 一句话结论：**抓到的从来不是 `isFromMockProvider`，而是同一个物理量在不同通道上对不上。**
 
-> 落地状态：§1、§2、§3、§4.1、§4.2、§4.3、§4.5、§4.6、§4.7、§5、§6 已全部实现，全量编译通过，
-> `core-geo` 单元测试 52 项 + `xposed` 28 项全绿；另有 §4.4 两条已知边界未改
+> 落地状态：§1、§2、§3、§4.1、§4.2、§4.3、§4.5、§4.6、§4.7、§4.8、§5、§6 已全部实现，全量编译通过，
+> `core-geo` 单元测试 52 项 + `xposed` 29 项全绿；另有 §4.4 两条已知边界未改
 > （基准海拔缺省值与静止位置精确，都需要产品决策）。
 > 验证边界见文末「本次改动的验证边界」。
 
@@ -438,6 +438,25 @@ internal object LocationAltitudeMetadata {
 没有区别；另外在 API 34+ 上「系统 GNSS 定位却完全没有 MSL」本身也是一种可探测特征——只是在
 「有 MSL 但数值是真机的」与「没有 MSL」之间，后者暴露的信息更少。
 
+### 4.8 首个 fix 的耗时被写死成 1000 ms（已实施）
+
+`GnssStatus.Callback#onFirstFix(ttffMillis)` 报的是「从启动 GNSS 到拿到第一个定位」的耗时。真机上这个数
+不固定：冷启动秒级到十几秒，热启动几百毫秒；但**一次会话内稳定**，不会来回跳。
+
+原来这条通道固定回 `1000`（`SystemLocationServiceHooker.kt:365`），同时 `GpsStatus` 那条老通道的
+`mTimeToFirstFix` 根本没动——于是同一次会话里两条通道给出两个不同的数（一个是常量 1000、一个来自框架），
+而且 1000 本身是所有用户共享的定值。
+
+改法：`RouteEngine.realisticTimeToFirstFixMs(config)` 用会话的 `start_timestamp` 派生一个
+`700~2999 ms` 的值——同场次恒定（符合真机语义）、换场次就变；`onFirstFix` 与 `GpsStatus.mTimeToFirstFix`
+两处都用它，两条通道因此同值。
+
+验证：新增 1 项单测（同场次重复取值相等、落在 700~2999、40 个不同场次至少 10 种取值、
+缺配置时仍给出合法值而不是 0 或 −1）。
+
+诚实边界：TTFF 与「实际等了多久」没有关系——我们在注册后立即派发，真机是等若干秒才首个 fix。
+这一条只消除了「数值本身是常量/跨通道不一致」，没有改派发时序（那会改变应用的等待行为，需要单独评估）。
+
 ---
 
 ## 5. 精度：原范围偏乐观（已实施：放宽基准，加慢变分量）
@@ -556,6 +575,7 @@ nextDispatchMs += dispatchPeriodMs
 | P2 | 卫星 ID 集合与天顶几何全员相同 | `SatelliteModel.sky()` + `GnssFastMockEngine` | 不同会话的 SVID 集合与仰角不相等；三条通道同源 | 已实施 |
 | P1 | 气压计通道完全没做 | `BarometerModel` + `RouteEngine.realisticPressureHpa()` + `SensorStepHooker` | 气压与 GPS 海拔自洽（反算偏差 < 5 m）；1 小时读数不止一种；静止时不断流 | 已实施 |
 | P1 | 就地改写只覆盖椭球高，MSL 海拔仍是真实值 | `LocationAltitudeMetadata` + `applyFakeLocationFields` | 同一 `Location` 上椭球高与 MSL 不出现「一真一假」；Google 融合定位路径不再漏改海拔 | 已实施 |
+| P2 | 首个 fix 耗时写死 1000 ms、两通道不一致 | `RouteEngine.realisticTimeToFirstFixMs()` | 同场次恒定、换场次变化、`onFirstFix` 与 `GpsStatus.mTimeToFirstFix` 同值 | 已实施 |
 | P2 | 基准海拔缺省 0 导致全员海平面 | `SettingsManager.kt:129` / `LocationRepository` | 不出现跨账号的同一基准值 | 未改（需产品决策，见 §4.4） |
 | P2 | 静止时位置精确等于配置坐标 | `LocationHooker` `isStationary` 分支 | 静止时仍有亚米级漂移 | 未改（见 §4.4） |
 
@@ -563,8 +583,8 @@ nextDispatchMs += dispatchPeriodMs
 
 ## 11. 本次改动的验证边界
 
-本仓库这一轮改了 13 项（§1、§2、§3、§4.1、§4.2、§4.3、§4.5 卫星数与天空几何、§4.6 气压计、
-§4.7 MSL 海拔与垂直精度、§5、§6、计步初值），
+本仓库这一轮改了 14 项（§1、§2、§3、§4.1、§4.2、§4.3、§4.5 卫星数与天空几何、§4.6 气压计、
+§4.7 MSL 海拔与垂直精度、§4.8 首个 fix 耗时、§5、§6、计步初值），
 **都没有打 APK、没有上真机**。按验证强度分七类：
 
 
@@ -578,12 +598,12 @@ nextDispatchMs += dispatchPeriodMs
 - `app-ui` / `core-data` / `service` 三个模块的 Compose、高德/百度 Maps 依赖在本机拿不到，
   没有本地编译；它们的编译由仓库的 `build` 工作流在 CI 上兜（`assembleScopedDebug`）。
 
-**② 单元测试（`core-geo` 9 个测试类、52 项 + `xposed` 5 个测试类、28 项）**
+**② 单元测试（`core-geo` 9 个测试类、52 项 + `xposed` 5 个测试类、29 项）**
 
 - 同样绕开 Gradle：编译 `core-geo/src/test` + JUnit 4.13.2 + hamcrest-core 1.3，
   用 `org.junit.runner.JUnitCore` 直接跑 → **OK (52 tests)**。
 - `xposed` 侧同样方式跑 `RouteEngineTest` / `HotReloadHostTest` / `VendorRegistryTest` /
-  `ColorOs16VendorTest` / `LocationAltitudeMetadataTest` → **OK (28 tests)**，其中包含两条既有断言：
+  `ColorOs16VendorTest` / `LocationAltitudeMetadataTest` → **OK (29 tests)**，其中包含两条既有断言：
   显式 `altitude_variation_m = 0` 时海拔恒为基准值（`assertEquals(80.0, …, 0.0)`），
   以及老配置（不写该键）落在 `base ± drift` 区间内。这两条是 §4.1 改动的回归护栏。
 - §4.5 的卫星数在两侧都有护栏：`SatelliteModelTest` 9 项（区间、包含关系、时间起伏、
@@ -681,6 +701,9 @@ nextDispatchMs += dispatchPeriodMs
 10. **海拔高与椭球高同源**：API 34+ 上同一时刻读 `Location.hasMslAltitude()` / `getMslAltitudeMeters()`
     与 `getAltitude()`——不能让「椭球高是模拟值、海拔高还是设备真实值」同时出现在一个对象里。
     再确认 `hasVerticalAccuracy()` 的字段不是恒定值（真机随定位质量变化）。
-11. **卫星 extras 与 GnssStatus 同源**：同一时刻取 `Location.extras` 的
+11. **TTFF 与首个 fix 一致**：同一时刻读 `GnssStatus.getTimeToFirstFix()`（或 `onFirstFix` 回调参数）
+    与 `GpsStatus.getTimeToFirstFix()`——两处应相等且落在几百毫秒到几秒之间，不能是同一个常量、
+    也不能一条是常量而另一条来自真实框架。
+12. **卫星 extras 与 GnssStatus 同源**：同一时刻取 `Location.extras` 的
     `satellites / satellites_in_view / satellites_used_in_fix`，与 `GnssStatus` 里
     `usedInFix` 的颗数对比——两处必须相等，不能各说一套。

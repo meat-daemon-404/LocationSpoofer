@@ -135,6 +135,19 @@ object RouteEngine {
         return BarometerModel.quantize(BarometerModel.pressureHpa(altitude, startTimestamp, elapsedSec))
     }
 
+    /**
+     * 首个 GNSS fix 的耗时（毫秒），即 `GnssStatus.Callback#onFirstFix(ttffMillis)` 报给应用的值。
+     *
+     * 真机这个数不是常量：冷启动在秒级到十几秒，热启动几百毫秒，同一场次内稳定、不同场次不同。
+     * 原来固定回 `1000`——又是一个"所有用户同一个数"的常量。这里由会话的 `start_timestamp`
+     * 定一个 700~2999 ms 之间的值，同一场次内恒定（真机就是这个语义），换一场就变。
+     */
+    fun realisticTimeToFirstFixMs(config: JSONObject): Int {
+        val seed = config.optLong("start_timestamp", 0L)
+        val spread = ((seed ushr 17) xor (seed ushr 41)).toInt() and 0x7FFF
+        return 700 + (spread % 2300)
+    }
+
     /** 配置里缺少真实度字段（旧版 App 写的配置）时按"关闭 + 不浮动"处理，行为与旧版一致 */
     fun realismSession(config: JSONObject, startTimestamp: Long = config.optLong("start_timestamp", 0L)): MotionRealism.Session =
         MotionRealism.session(

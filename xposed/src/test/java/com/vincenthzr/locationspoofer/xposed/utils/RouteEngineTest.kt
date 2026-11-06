@@ -1,5 +1,6 @@
 package com.vincenthzr.locationspoofer.xposed.utils
 
+import com.vincenthzr.locationspoofer.utils.BarometerModel
 import org.json.JSONArray
 import org.json.JSONObject
 import org.junit.Assert.assertEquals
@@ -214,5 +215,37 @@ class RouteEngineTest {
             .map { RouteEngine.realisticSatelliteCounts(cfg(20, 1_000_000L + it * 37 * 60_000L), now = 1_700_000L).visible }
             .toSet()
         assertTrue(perRun.size >= 3)
+    }
+
+    @Test
+    fun `barometer pressure follows the spoofed altitude and still drifts`() {
+        fun cfg(start: Long, variation: Double? = null) = JSONObject().apply {
+            put("is_route_mode", false)
+            put("lat", 31.5)
+            put("lng", 120.5)
+            put("altitude", 25.0)
+            put("start_timestamp", start)
+            if (variation != null) put("altitude_variation_m", variation)
+        }
+
+        val start = 1_000_000L
+        // 气压必须由同一时刻的海拔换算而来：把海拔代回标准大气公式应与读数一致（差在量化步进内）
+        (0..600 step 60).forEach { offset ->
+            val now = start + offset * 1000L
+            val altitude = RouteEngine.realisticAltitude(cfg(start), now = now)
+            val pressure = RouteEngine.realisticPressureHpa(cfg(start), now = now)
+            val expected = BarometerModel.pressureHpa(altitude, start, (now - start) / 1000.0)
+            assertEquals(expected, pressure, BarometerModel.RESOLUTION_HPA)
+        }
+
+        // 一场跑下来读数不能是一条直线（否则又是"跨会话相同的常量"指纹）
+        val readings = (0..1800 step 30).map { RouteEngine.realisticPressureHpa(cfg(start), now = start + it * 1000L) }.toSet()
+        assertTrue(readings.size >= 5)
+
+        // 显式关掉海拔变化时，气压就只剩波动，不应出现几十 hPa 的跳变
+        val fixed = (0..1800 step 30).map {
+            RouteEngine.realisticPressureHpa(cfg(start, variation = 0.0), now = start + it * 1000L)
+        }
+        assertTrue(fixed.max() - fixed.min() <= 1.0)
     }
 }

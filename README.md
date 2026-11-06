@@ -1,4 +1,4 @@
-﻿<div align="center">
+<div align="center">
 
 <h1>LocationSpoofer</h1>
 
@@ -117,12 +117,13 @@
 ### 5. 卫星矩阵与 NMEA 模拟
 * **GnssStatus 矩阵注入**：Hook 系统的 `GnssStatus` 类，模拟 20+ 颗包括 GPS、北斗、GLONASS 的卫星分布矩阵，注入 PRN 标识、信噪比（CNR）、俯仰角、方位角等，并正确汇报 `usedInFix` 状态。
 * **NMEA 语句流动态拼装**：劫持 `OnNmeaMessageListener` / `GpsStatus.NmeaListener`，根据当前模拟坐标、航向角、速度和卫星信息，动态拼装符合规范的原始 `$GPGGA`, `$GPRMC`, `$GPGSA`, `$GPGSV` 语句并计算校验和（Checksum）输出。
-* **卫星元数据保活注入**：在向各大地图 SDK 派发 `Location` 对象时，强制在 `getExtras()` 中注入 `satellites=20`, `satellites_in_view=20`, `satellites_used_in_fix=18`，防止定位 SDK 判定无卫星搜星而丢弃 GPS 信号。
+* **卫星元数据保活注入**：向各大地图 SDK 派发 `Location` 时在 `getExtras()` 里注入卫星颗数，防止定位 SDK 判定无卫星搜星而丢弃 GPS 信号。颗数不是写死的常量，而是按「可见 / 在视野 / 参与解算」三口径随时间起伏，且满足 `used_in_fix ≤ visible ≤ in_view`（依据见 [docs/anti-detection-empirical.md](docs/anti-detection-empirical.md)）。
 
 ### 6. 传感器与步频模拟
 * **计步传感器联动**：Hook `SensorManager`，接管 `Sensor.TYPE_STEP_COUNTER`（总步数）和 `Sensor.TYPE_STEP_DETECTOR`（单步脉冲）。
 * **步态频率计算**：当开启路线模拟且处于步行或跑步状态时，根据移动距离与步长（默认按 `0.7m/步` 换算）自动生成平滑递增的步数事件，适配运动健康与校园跑打卡软件。
 * **双通道同源**：`TYPE_STEP_DETECTOR` 按真实步频「每步一个事件」派发，事件时间戳取该步真实跨越时刻，使「检测器步频 / 计数器增量 / 位置通道速度」三者自洽（依据见 [docs/anti-detection-empirical.md](docs/anti-detection-empirical.md)）。
+* **气压计联动**：Hook `Sensor.TYPE_PRESSURE`，按国际标准大气把当前模拟海拔换算成气压（与 `SensorManager.getAltitude()` 同一组常数），叠极小慢波动并量化到 `0.01 hPa`；设备本身没有气压计时可注入虚拟传感器。静止时独立按 1 Hz 派发，不会因为"没在走路"而断流。
 
 ### 7. 路线规划与红绿灯模拟
 * **真实路网拟合**：支持多点路径规划，调用路网搜索算法拟合实际道路轮廓，防止直线穿墙。

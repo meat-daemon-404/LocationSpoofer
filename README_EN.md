@@ -1,4 +1,4 @@
-﻿<div align="center">
+<div align="center">
 
 <h1>LocationSpoofer</h1>
 
@@ -112,11 +112,12 @@ Real GPS receivers naturally output coordinates with Gaussian white noise caused
 ### 5. Satellite Matrix & NMEA Generation
 * **GnssStatus Matrix Injection**: Hooks `GnssStatus` to simulate 20+ active satellites (GPS, BeiDou, GLONASS) with valid PRNs, signal-to-noise ratios (CNR/SNR), azimuths, elevations, and `usedInFix` flags.
 * **Dynamic NMEA Protocol Streaming**: Intercepts `OnNmeaMessageListener` / `GpsStatus.NmeaListener` and dynamically generates compliant raw `$GPGGA`, `$GPRMC`, `$GPGSA`, `$GPGSV` sentences in memory with accurate checksums.
-* **Satellite Metadata Keep-Alive**: Injects `satellites=20`, `satellites_in_view=20`, `satellites_used_in_fix=18` into `Location.getExtras()` to prevent map SDKs from discarding GPS signals due to missing satellite locks.
+* **Satellite Metadata Keep-Alive**: Injects satellite counts into `Location.getExtras()` so map SDKs do not discard a GPS signal for lack of satellite locks. The counts are not hardcoded constants — they drift over time across three consistent figures (visible / in view / used in fix) with `used_in_fix ≤ visible ≤ in_view` always holding.
 
 ### 6. Step Sensor & Motion Simulation
 * **Step Counter Linkage**: Hooks `SensorManager` and emulates `Sensor.TYPE_STEP_COUNTER` (cumulative steps) and `Sensor.TYPE_STEP_DETECTOR` (step triggers).
 * **Speed-to-Cadence Translation**: Automatically calculates and triggers smooth step increments based on simulated speed and stride length (`~0.7m/step`), compatible with WeChat Sports, fitness trackers, and campus running apps.
+* **Barometer Linkage**: Hooks `Sensor.TYPE_PRESSURE` and converts the simulated altitude into pressure with the international standard atmosphere (same constants as `SensorManager.getAltitude()`), adding a slow micro-swing quantized to `0.01 hPa`. On devices without a barometer a virtual sensor can be injected. It is dispatched on its own 1 Hz tick, so readings do not stall while standing still.
 
 ### 7. Route Planning & Traffic Light Simulation
 * **Real Road Snapping**: Multi-point routing algorithms snap trajectories to physical streets, preventing straight-line navigation through buildings.

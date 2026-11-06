@@ -9,8 +9,8 @@
 
 一句话结论：**抓到的从来不是 `isFromMockProvider`，而是同一个物理量在不同通道上对不上。**
 
-> 落地状态：§1、§2、§3、§4.1、§4.2、§4.3、§4.5、§5、§6 已全部实现，全量编译通过，
-> `core-geo` 单元测试 45 项 + `xposed` 24 项全绿；另有 §4.4 两条已知边界未改
+> 落地状态：§1、§2、§3、§4.1、§4.2、§4.3、§4.5、§4.6、§5、§6 已全部实现，全量编译通过，
+> `core-geo` 单元测试 52 项 + `xposed` 25 项全绿；另有 §4.4 两条已知边界未改
 > （基准海拔缺省值与静止位置精确，都需要产品决策）。
 > 验证边界见文末「本次改动的验证边界」。
 
@@ -326,6 +326,68 @@ GPS 1-32 / GLONASS 1-24 / Galileo 1-36），每颗卫星的仰角/方位漂移�
 仍是固定模板——只是轮换起点随会话变，不是每个会话独立随机。要彻底去模板化就得引入按会话随机的
 星座-编号映射，但那会和「BDS 的 SVID 只能取 1-35」这类真实约束冲突，收益不明显，本轮不做。
 
+### 4.6 气压计完全没做（已实施）
+
+前面几条都是「改错了值」，这一条更彻底：**整条通道根本没有**。
+
+`xposed` 目录里 `TYPE_PRESSURE` / `barometer` / `pressure` 三个词一次都没出现过，
+也就是说模拟只改了 GPS 海拔，气压计给目标应用的仍然是设备所在真实环境的气压。于是：
+
+* 轨迹声称在海拔 800 m 的山地，手机实际放在 50 m 的房间里 → 气压计换算出的海拔
+  比 GPS 海拔低几百米，两条通道当场对不上；
+* 手环类 App 用气压计算「累计爬升」，模拟路线的高低起伏在气压通道上是**零**，
+  而 GPS 侧却在变（§4.1 之后落差有 1~4 m 量级），同样是自相矛盾；
+* 更进一步，一部分机型没有气压计。这时目标应用调 `getDefaultSensor(TYPE_PRESSURE)`
+  会拿到 `null`，而它的"设备能力表"里本机是有气压计的——这是设备身份层面的不一致。
+
+改法不是"再造一条随机曲线"，而是让气压**由同一份海拔换算出来**，两条通道在任何时刻自洽：
+
+`core-geo` 新增 `BarometerModel`：
+
+| 量 | 构造 |
+|---|---|
+| 基准换算 | `P = 1013.25 · (1 − h / 44330) ^ 5.255`（国际标准大气对流层近似） |
+| 海拔量程 | 夹到 −500 … 10000 m，避免算出 0 或负压 |
+| 慢波动 | `SmoothNoise(seed, 40s, 180s)` × 0.35 hPa，`seed = start_timestamp` |
+| 分辨率 | 量化到 0.01 hPa（主流气压计的读数分辨率） |
+
+选 44330 / 5.255 这组常数的原因很实际：Android 的 `SensorManager.getAltitude()`
+用的就是同一组常数，所以目标应用把我们的气压换算回海拔，落点与 GPS 海拔只差几米，
+不会出现"两个海拔"。
+
+`xposed` 侧新增唯一出口 `RouteEngine.realisticPressureHpa(config, now)`（内部调用
+`realisticAltitude`），并接三条路径：
+
+| 设备情况 | 路径 | 做法 |
+|---|---|---|
+| 本机有气压计 | `dispatchSensorEvent` / `onSensorChanged` | **改写**真实事件的值与时间戳，保留系统自己的上报频率 |
+| 本机没有气压计 | `getDefaultSensor` / `getSensorList` | 注入虚拟 `TYPE_PRESSURE`（分辨率 0.01 hPa、功耗 0.007 mA，与 BMP 系列一致） |
+| 注入的虚拟传感器 | `dispatchPressureEvents` | 独立 1 Hz 派发，静止时也不停 |
+
+第三条要独立于计步派发，是因为 `dispatchStepEvents` 在速度 ≤ 0.05 时整段提前返回
+（静止时不该推进数），而真机气压计在静止时照样按固定频率上报——挂在计步链上会让
+静止阶段的读数断流，`Δp/Δt` 出现不该有的空档。
+
+实测（30 分钟 @1 Hz，基准海拔 25 m，变化范围 10 m，漂移 2 m）：
+
+| 指标 | 数值 |
+|---|---|
+| 读数跨度 | 0.720 hPa（1010.28 ~ 1011.00） |
+| 不同取值个数 | 73 |
+| 换算回海拔的最大偏差 | 2.59 m（纯公式部分为 0.000 m，偏差全来自那 0.35 hPa 波动） |
+| 20 个不同场次同一时刻的取值 | 14 种 |
+| 相邻两秒最大变化 | 0.03 hPa（1200 秒里 372 秒读数不变） |
+| 海平面 / 100 m / 1000 m | 1013.25 / 1001.30 / 898.76 hPa |
+
+开关：配置键 `barometer_simulation`（缺省 **true**，只有 `active` 时生效）。设备本身没有
+气压计时，注入虚拟传感器也受这个开关控制——否则会凭空多出一个传感器，成了新指纹。
+
+仍未做：
+
+* App 侧没有这个开关的 UI（只能通过配置文件里显式写 `false` 关掉）；
+* 没做温度通道（`TYPE_AMBIENT_TEMPERATURE`），真机气压计通常同时暴露温度；
+* 虚拟气压计的传感器名/厂商是固定的 `Pressure Sensor / Android`，与真实设备型号无关。
+
 ---
 
 ## 5. 精度：原范围偏乐观（已实施：放宽基准，加慢变分量）
@@ -442,6 +504,7 @@ nextDispatchMs += dispatchPeriodMs
 | P2 | 精度基准随区域/时段慢变 | `getJitteredAccuracy()` | 慢变分量周期在分钟级 | 已实施（简单版） |
 | P1 | 卫星数是跨通道对不上的常量 | `SatelliteModel` + `RouteEngine.realisticSatelliteCounts()` | `used_in_fix ≤ visible ≤ in_view` 恒成立；1 小时内取值不止一种 | 已实施 |
 | P2 | 卫星 ID 集合与天顶几何全员相同 | `SatelliteModel.sky()` + `GnssFastMockEngine` | 不同会话的 SVID 集合与仰角不相等；三条通道同源 | 已实施 |
+| P1 | 气压计通道完全没做 | `BarometerModel` + `RouteEngine.realisticPressureHpa()` + `SensorStepHooker` | 气压与 GPS 海拔自洽（反算偏差 < 5 m）；1 小时读数不止一种；静止时不断流 | 已实施 |
 | P2 | 基准海拔缺省 0 导致全员海平面 | `SettingsManager.kt:129` / `LocationRepository` | 不出现跨账号的同一基准值 | 未改（需产品决策，见 §4.4） |
 | P2 | 静止时位置精确等于配置坐标 | `LocationHooker` `isStationary` 分支 | 静止时仍有亚米级漂移 | 未改（见 §4.4） |
 
@@ -449,26 +512,26 @@ nextDispatchMs += dispatchPeriodMs
 
 ## 11. 本次改动的验证边界
 
-本仓库这一轮改了 11 项（§1、§2、§3、§4.1、§4.2、§4.3、§4.5 卫星数与天空几何、§5、§6、计步初值），
-**都没有打 APK、没有上真机**。按验证强度分五类：
+本仓库这一轮改了 12 项（§1、§2、§3、§4.1、§4.2、§4.3、§4.5 卫星数与天空几何、§4.6 气压计、§5、§6、计步初值），
+**都没有打 APK、没有上真机**。按验证强度分六类：
 
 
 **① 全量编译（`core-geo` + `xposed`）**
 
-- 用 `kotlin-compiler-embeddable 2.0.0` 直接以命令行编译两个模块的全部 68 个 Kotlin 源文件
+- 用 `kotlin-compiler-embeddable 2.0.0` 直接以命令行编译两个模块的全部 70 个 Kotlin 源文件
   加 1 份 `BuildConfig` 桩（classpath = `android-34/android.jar` + libxposed API jar），
-  产出 365 个 class，**退出码 0、无错误**。
+  产出 366 个 class，**退出码 0、无错误**。
 - `core-geo` 用到的 `BuildConfig` 需要一份桩（真 BuildConfig 由 flavor 生成），
   桩只要 `const val GLOBAL_SCHEME: Boolean`。
 - `app-ui` / `core-data` / `service` 三个模块的 Compose、高德/百度 Maps 依赖在本机拿不到，
   没有本地编译；它们的编译由仓库的 `build` 工作流在 CI 上兜（`assembleScopedDebug`）。
 
-**② 单元测试（`core-geo` 8 个测试类、45 项 + `xposed` 24 项）**
+**② 单元测试（`core-geo` 9 个测试类、52 项 + `xposed` 25 项）**
 
 - 同样绕开 Gradle：编译 `core-geo/src/test` + JUnit 4.13.2 + hamcrest-core 1.3，
-  用 `org.junit.runner.JUnitCore` 直接跑 → **OK (45 tests)**。
+  用 `org.junit.runner.JUnitCore` 直接跑 → **OK (52 tests)**。
 - `xposed` 侧同样方式跑 `RouteEngineTest` / `HotReloadHostTest` / `VendorRegistryTest` /
-  `ColorOs16VendorTest` → **OK (24 tests)**，其中包含两条既有断言：
+  `ColorOs16VendorTest` → **OK (25 tests)**，其中包含两条既有断言：
   显式 `altitude_variation_m = 0` 时海拔恒为基准值（`assertEquals(80.0, …, 0.0)`），
   以及老配置（不写该键）落在 `base ± drift` 区间内。这两条是 §4.1 改动的回归护栏。
 - §4.5 的卫星数在两侧都有护栏：`SatelliteModelTest` 9 项（区间、包含关系、时间起伏、
@@ -476,6 +539,9 @@ nextDispatchMs += dispatchPeriodMs
   不同会话看到不同星座段），`RouteEngineTest` 里 1 项从配置 JSON 走完整条链路断言同一组关系。
 - 其中 `RoutePathTest` 覆盖开环折返、闭环前进、到站停留与 `GeoMath` 一致性，
   bearing 平滑改动后全部仍通过（关键：位置与朝向在直段上逐位不变）。
+- §4.6 的气压通道两侧同样有护栏：`BarometerModelTest` 7 项（海平面基准、海拔单调性、
+  低空梯度、往返换算、时间起伏、跨场次分散、量程夹断、量化步进），`RouteEngineTest` 里
+  1 项从配置 JSON 走完整链路，断言「气压换算回的海拔」与「GPS 海拔」相差不超过一个量化步进。
 
 **③ 自建测量用例（bearing 差分）**
 
@@ -513,9 +579,22 @@ nextDispatchMs += dispatchPeriodMs
   ——这就是「GnssStatus 的 usedInFix 标志」与「`satellites_used_in_fix` 数值」不会打架的原因。
 - 1 小时 @1 分钟全量检查：仰角落在 `16.00–88.00°`（构造上截断在 8–88），方位越界次数 **0**。
 
+**⑦ 数值对照（气压计，30 分钟 @1 Hz）**
+
+- 同一份采样代码，基准海拔 25 m、变化范围 10 m、漂移 2 m：读数 `1010.28 ~ 1011.00`，
+  跨度 **0.720 hPa**、**73 种**取值；改前这条通道根本不存在，也就没有读数。
+- 把我们的气压按 ISA 反算回海拔，与 GPS 海拔的最大偏差 **2.59 m**；纯公式部分偏差
+  **0.000 m**，那 2.59 m 全部来自 0.35 hPa 的慢波动——也就是说目标应用无论用哪条通道，
+  海拔都对得上（真实 GNSS 海拔自身的误差本来就在 5~10 m）。
+- 20 个不同场次在同一时刻：14 种取值（1010.3 ~ 1010.7 hPa），不是全体同一个数。
+- 相邻两秒的最大变化 0.03 hPa，1200 秒里有 372 秒读数不变——这是 0.01 hPa 分辨率下
+  应有的表现，不是每帧乱跳。
+- ISA 基准点自检：0 m → 1013.25 hPa、100 m → 1001.30 hPa、1000 m → 898.76 hPa。
+
 **仍然不能确定的是真机运行时行为**：反射构造 `SensorEvent` 的三条 fallback 路径、
 不同 ROM 下 `TYPE_STEP_DETECTOR` 的实际投递节奏、`Thread.sleep` 网格在真机上的实际抖动
 （§6 的 996/1004 ms 来自另一套独立实现的外部实测，不是本仓库测的）、
+虚拟 `TYPE_PRESSURE` 传感器能否被目标应用正常枚举、
 以及 ColorOS 16 适配路径的实机命中情况。
 
 
@@ -540,3 +619,7 @@ nextDispatchMs += dispatchPeriodMs
    `GnssStatus` 逐颗的 `svid/azimuth/elevation`、`Location.extras` 里的颗数——三处必须自洽；
    换一个 `start_timestamp` 重跑，SVID 集合与仰角必须不同。同时量相邻两秒的仰角差
    （应是小量连续变化，不是跳变）。
+9. **气压计与海拔自洽**：注册 `TYPE_PRESSURE`，把读数按 ISA 换算成海拔，与同一时刻
+   `Location.getAltitude()` 比——差值应在一个量化步进到几米之间，不能是"气压在海平面、
+   GPS 在山上"这种量级差。再静止不动 5 分钟，读数应仍有小幅变化（真机气压计不会跳数停摆）。
+   设备本身没有气压计时，确认目标应用枚举到的是我们注入的虚拟气压计，且关掉开关后它消失。

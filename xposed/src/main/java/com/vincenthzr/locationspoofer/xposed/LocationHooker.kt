@@ -1056,6 +1056,8 @@ class LocationHooker : XposedModule() {
                                         // 5. Sensor Step Simulation
                                         if (cl != null) {
                                             SensorStepHooker.dispatchStepEvents(newConfig, cl)
+                                            // 气压计走独立派发：静止时计步那条链会提前返回，但真机气压计不会停
+                                            SensorStepHooker.dispatchPressureEvents(newConfig, cl)
                                         }
                                     }
 

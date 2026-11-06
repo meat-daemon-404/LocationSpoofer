@@ -66,6 +66,7 @@ object SensorStepHooker {
     private var mockStepCounterSensor: Sensor? = null
     private var mockStepDetectorSensor: Sensor? = null
     private var mockAccelerometerSensor: Sensor? = null
+    private var mockPressureSensor: Sensor? = null
 
     // 跟踪 handle 到 sensor type 的映射
     private val handleToTypeMap = ConcurrentHashMap<Int, Int>()
@@ -84,7 +85,7 @@ object SensorStepHooker {
                 XposedHelpers.hookAllMethods(managerClass, "getDefaultSensor") { chain, _ ->
                     val result = chain.proceed(chain.args.toTypedArray())
                     val type = (chain.args.firstOrNull() as? Int) ?: return@hookAllMethods result
-                    if (result == null && (type == Sensor.TYPE_STEP_COUNTER || type == Sensor.TYPE_STEP_DETECTOR)) {
+                    if (result == null && isSimulatedSensorType(type)) {
                         return@hookAllMethods getOrCreateMockSensor(type, classLoader)
                     }
                     return@hookAllMethods result
@@ -96,7 +97,7 @@ object SensorStepHooker {
                 XposedHelpers.hookAllMethods(managerClass, "getSensorList") { chain, _ ->
                     val result = chain.proceed(chain.args.toTypedArray())
                     val type = (chain.args.firstOrNull() as? Int) ?: return@hookAllMethods result
-                    if (type == Sensor.TYPE_STEP_COUNTER || type == Sensor.TYPE_STEP_DETECTOR) {
+                    if (isSimulatedSensorType(type)) {
                         if (result is List<*> && result.isEmpty()) {
                             val mock = getOrCreateMockSensor(type, classLoader)
                             if (mock != null) return@hookAllMethods listOf(mock)
@@ -130,14 +131,16 @@ object SensorStepHooker {
 
                         if (listener != null) {
                             val targetSensor = sensor ?: getOrCreateMockSensor(Sensor.TYPE_STEP_COUNTER, classLoader)
-                            if (targetSensor != null && (targetSensor.type == Sensor.TYPE_STEP_COUNTER || targetSensor.type == Sensor.TYPE_STEP_DETECTOR || targetSensor.type == Sensor.TYPE_ACCELEROMETER)) {
+                            if (targetSensor != null && isCapturedSensorType(targetSensor.type)) {
                                 val entry = CapturedSensorListener(listener, targetSensor, handler)
                                 if (!capturedListeners.any { it.listener === listener && it.sensor?.type == targetSensor.type }) {
                                     capturedListeners.add(entry)
                                 }
 
+                                // 虚拟 Sensor 的 mHandle 是 0，映射进去会和 handle=0 的真实传感器撞车，
+                                // 所以只为真实传感器登记 handle（气压计走"改写真实事件"而非"补发事件"路径）
                                 val handle = getSensorHandle(targetSensor)
-                                if (handle != null) {
+                                if (handle != null && targetSensor !== mockPressureSensor) {
                                     handleToTypeMap[handle] = targetSensor.type
                                 }
 
@@ -179,7 +182,7 @@ object SensorStepHooker {
 
             XposedHelpers.hookAllMethods(eventQueueClass, "dispatchSensorEvent") { chain, _ ->
                 val config = (XposedHelpers.module as? LocationHooker)?.readConfig()
-                if (config != null && config.optBoolean("active", false) && config.optBoolean("enable_step_simulation", true)) {
+                if (config != null && config.optBoolean("active", false)) {
                     val handle = chain.args.firstOrNull() as? Int
                     val values = chain.args.getOrNull(1) as? FloatArray
 
@@ -187,18 +190,25 @@ object SensorStepHooker {
                         val sensorType = handleToTypeMap[handle]
                         val speed = config.optDouble("speed_m_s", 0.0)
 
-                        if (sensorType == Sensor.TYPE_STEP_COUNTER) {
-                            // 仅对明确判定的计步器传感器进行步数计算，严禁误判光感/距离传感器
-                            val curSteps = calculateCurrentSteps(config)
-                            values[0] = curSteps.toFloat()
-                        } else if (sensorType == Sensor.TYPE_STEP_DETECTOR) {
-                            if (speed > 0.1) {
-                                values[0] = 1.0f
+                        if (sensorType == Sensor.TYPE_PRESSURE) {
+                            // 气压计与步频模拟无关：静止时也照样按海拔换算，只看气压模拟开关
+                            if (barometerEnabled(config)) {
+                                applySyntheticPressure(values, config)
                             }
-                        } else if (sensorType == Sensor.TYPE_ACCELEROMETER && values.size >= 3) {
-                            // 加速度计传感器：仅在运动中(speed > 0.1)叠加生理跑步/步行震动特征，静态时绝不篡改
-                            if (speed > 0.1) {
-                                applySyntheticVibration(values, config, speed)
+                        } else if (config.optBoolean("enable_step_simulation", true)) {
+                            if (sensorType == Sensor.TYPE_STEP_COUNTER) {
+                                // 仅对明确判定的计步器传感器进行步数计算，严禁误判光感/距离传感器
+                                val curSteps = calculateCurrentSteps(config)
+                                values[0] = curSteps.toFloat()
+                            } else if (sensorType == Sensor.TYPE_STEP_DETECTOR) {
+                                if (speed > 0.1) {
+                                    values[0] = 1.0f
+                                }
+                            } else if (sensorType == Sensor.TYPE_ACCELEROMETER && values.size >= 3) {
+                                // 加速度计传感器：仅在运动中(speed > 0.1)叠加生理跑步/步行震动特征，静态时绝不篡改
+                                if (speed > 0.1) {
+                                    applySyntheticVibration(values, config, speed)
+                                }
                             }
                         }
                     }
@@ -212,7 +222,9 @@ object SensorStepHooker {
         capturedListeners.map { arrayOf<Any?>(it.listener, it.sensor, it.handler) }.toTypedArray(),
         stepBase, lastStepsFloat, lastStepInitTime,
         mockStepCounterSensor, mockStepDetectorSensor, mockAccelerometerSensor,
-        handleToTypeMap.map { arrayOf(it.key, it.value) }.toTypedArray()
+        handleToTypeMap.map { arrayOf(it.key, it.value) }.toTypedArray(),
+        // 追加到末尾而不是插在中间：热重载状态是只在本进程内传递的数组，改下标会让旧状态解析错位
+        mockPressureSensor
     )
 
     internal fun clearReloadState() { capturedListeners.clear(); hookedListenerClasses.clear() }
@@ -232,6 +244,7 @@ object SensorStepHooker {
         (state[7] as? Array<*>)?.filterIsInstance<Array<*>>()?.forEach {
             handleToTypeMap[it[0] as Int] = it[1] as Int
         }
+        mockPressureSensor = state.getOrNull(8) as? Sensor
     }
 
     /**
@@ -244,20 +257,28 @@ object SensorStepHooker {
                     val event = chain.args.firstOrNull() as? SensorEvent
                     if (event != null && event.sensor != null) {
                         val config = (XposedHelpers.module as? LocationHooker)?.readConfig()
-                        if (config != null && config.optBoolean("active", false) && config.optBoolean("enable_step_simulation", true)) {
+                        if (config != null && config.optBoolean("active", false)) {
                             val speed = config.optDouble("speed_m_s", 0.0)
-                            if (event.sensor.type == Sensor.TYPE_STEP_COUNTER && event.values.isNotEmpty()) {
-                                val curSteps = calculateCurrentSteps(config)
-                                event.values[0] = curSteps.toFloat()
-                                event.timestamp = SystemClock.elapsedRealtimeNanos()
-                            } else if (event.sensor.type == Sensor.TYPE_STEP_DETECTOR && event.values.isNotEmpty()) {
-                                if (speed > 0.1) {
-                                    event.values[0] = 1.0f
+                            if (event.sensor.type == Sensor.TYPE_PRESSURE) {
+                                // 气压计：静止时也要换算，只看气压模拟开关
+                                if (barometerEnabled(config)) {
+                                    applySyntheticPressure(event.values, config)
                                     event.timestamp = SystemClock.elapsedRealtimeNanos()
                                 }
-                            } else if (event.sensor.type == Sensor.TYPE_ACCELEROMETER && event.values.size >= 3 && speed > 0.1) {
-                                applySyntheticVibration(event.values, config, speed)
-                                event.timestamp = SystemClock.elapsedRealtimeNanos()
+                            } else if (config.optBoolean("enable_step_simulation", true)) {
+                                if (event.sensor.type == Sensor.TYPE_STEP_COUNTER && event.values.isNotEmpty()) {
+                                    val curSteps = calculateCurrentSteps(config)
+                                    event.values[0] = curSteps.toFloat()
+                                    event.timestamp = SystemClock.elapsedRealtimeNanos()
+                                } else if (event.sensor.type == Sensor.TYPE_STEP_DETECTOR && event.values.isNotEmpty()) {
+                                    if (speed > 0.1) {
+                                        event.values[0] = 1.0f
+                                        event.timestamp = SystemClock.elapsedRealtimeNanos()
+                                    }
+                                } else if (event.sensor.type == Sensor.TYPE_ACCELEROMETER && event.values.size >= 3 && speed > 0.1) {
+                                    applySyntheticVibration(event.values, config, speed)
+                                    event.timestamp = SystemClock.elapsedRealtimeNanos()
+                                }
                             }
                         }
                     }
@@ -275,6 +296,66 @@ object SensorStepHooker {
         values[0] = synthetic[0]
         values[1] = synthetic[1]
         values[2] = synthetic[2]
+    }
+
+    /** 气压模拟是否开启：默认开启，用户显式关掉（`barometer_simulation = false`）时完全不动这一路 */
+    private fun barometerEnabled(config: JSONObject?): Boolean =
+        config != null && config.optBoolean("active", false) && config.optBoolean("barometer_simulation", true)
+
+    /**
+     * 需要注入虚拟实例的传感器类型。计步两类恒注入（老行为）；气压计只在开启模拟时注入，
+     * 否则设备本来没有气压计时会凭空多出一个传感器，反而是新指纹。
+     */
+    private fun isSimulatedSensorType(type: Int): Boolean = when (type) {
+        Sensor.TYPE_STEP_COUNTER, Sensor.TYPE_STEP_DETECTOR -> true
+        Sensor.TYPE_PRESSURE -> barometerEnabled((XposedHelpers.module as? LocationHooker)?.readConfig())
+        else -> false
+    }
+
+    /** 需要在 registerListener 里捕获的传感器类型（捕获后要么改写事件，要么补发事件） */
+    private fun isCapturedSensorType(type: Int): Boolean = when (type) {
+        Sensor.TYPE_STEP_COUNTER, Sensor.TYPE_STEP_DETECTOR, Sensor.TYPE_ACCELEROMETER -> true
+        Sensor.TYPE_PRESSURE -> mockPressureSensor != null || barometerEnabled((XposedHelpers.module as? LocationHooker)?.readConfig())
+        else -> false
+    }
+
+    /**
+     * 把真实气压计事件的值改写成"由海拔换算出来的气压"。
+     *
+     * 之所以改写真实事件而不是另发一遍：设备本身有气压计时，系统仍在按自己的频率（常见 5~10 Hz）
+     * 送来真实读数，再补发一批只会在同一条通道上出现两个互不相干的序列。
+     */
+    private fun applySyntheticPressure(values: FloatArray, config: JSONObject) {
+        if (values.isEmpty()) return
+        values[0] = RouteEngine.realisticPressureHpa(config).toFloat()
+    }
+
+    /**
+     * 由 ConfigPoller 每秒向"我们注入的虚拟气压计"的监听器补发一个事件。
+     *
+     * 与 [dispatchStepEvents] 分开的原因：计步派发在静止时整段提前返回（速度 ≤ 0.05 直接 return），
+     * 而真机气压计在静止时照样按固定频率上报——挂在那条链路上会让静止阶段的读数断流。
+     */
+    fun dispatchPressureEvents(config: JSONObject, classLoader: ClassLoader) {
+        if (!barometerEnabled(config)) return
+        val mock = mockPressureSensor ?: return
+        val listeners = capturedListeners.filter { it.sensor === mock }
+        if (listeners.isEmpty()) return
+
+        val event = createSensorEvent(mock, floatArrayOf(RouteEngine.realisticPressureHpa(config).toFloat())) ?: return
+        for (entry in listeners) {
+            val targetHandler = entry.handler ?: Handler(Looper.getMainLooper())
+            val listener = entry.listener
+            targetHandler.post {
+                try {
+                    if (listener is SensorEventListener) {
+                        listener.onSensorChanged(event)
+                    } else {
+                        XposedHelpers.callMethod(listener, "onSensorChanged", event)
+                    }
+                } catch (_: Throwable) {}
+            }
+        }
     }
 
     /** 用户录制的步态模板（配置里的编码字符串），按字符串内容缓存解码结果 */
@@ -452,6 +533,7 @@ object SensorStepHooker {
         if (type == Sensor.TYPE_STEP_COUNTER && mockStepCounterSensor != null) return mockStepCounterSensor
         if (type == Sensor.TYPE_STEP_DETECTOR && mockStepDetectorSensor != null) return mockStepDetectorSensor
         if (type == Sensor.TYPE_ACCELEROMETER && mockAccelerometerSensor != null) return mockAccelerometerSensor
+        if (type == Sensor.TYPE_PRESSURE && mockPressureSensor != null) return mockPressureSensor
 
         try {
             val sensorClass = Class.forName("android.hardware.Sensor", false, classLoader)
@@ -463,17 +545,20 @@ object SensorStepHooker {
             setSensorField(sensor, "mName", when(type) {
                 Sensor.TYPE_STEP_COUNTER -> "Step Counter Sensor"
                 Sensor.TYPE_STEP_DETECTOR -> "Step Detector Sensor"
+                Sensor.TYPE_PRESSURE -> "Pressure Sensor"
                 else -> "Accelerometer Sensor"
             })
             setSensorField(sensor, "mVendor", "Android")
             setSensorField(sensor, "mVersion", 1)
-            setSensorField(sensor, "mResolution", 1.0f)
-            setSensorField(sensor, "mPower", 0.05f)
+            // 气压计的量程/分辨率/功耗按常见型号（BMP 系列）取值，单位 hPa / mA
+            setSensorField(sensor, "mResolution", if (type == Sensor.TYPE_PRESSURE) 0.01f else 1.0f)
+            setSensorField(sensor, "mPower", if (type == Sensor.TYPE_PRESSURE) 0.007f else 0.05f)
 
             when (type) {
                 Sensor.TYPE_STEP_COUNTER -> mockStepCounterSensor = sensor
                 Sensor.TYPE_STEP_DETECTOR -> mockStepDetectorSensor = sensor
                 Sensor.TYPE_ACCELEROMETER -> mockAccelerometerSensor = sensor
+                Sensor.TYPE_PRESSURE -> mockPressureSensor = sensor
             }
             return sensor
         } catch (_: Throwable) {

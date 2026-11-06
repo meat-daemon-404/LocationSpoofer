@@ -1,6 +1,7 @@
 package com.vincenthzr.locationspoofer.xposed.utils
 
 import com.vincenthzr.locationspoofer.utils.AltitudeModel
+import com.vincenthzr.locationspoofer.utils.BarometerModel
 import com.vincenthzr.locationspoofer.utils.CoordinateUtils.LatLng
 import com.vincenthzr.locationspoofer.utils.GeoMath
 import com.vincenthzr.locationspoofer.utils.MotionRealism
@@ -119,6 +120,20 @@ object RouteEngine {
             seed = config.optLong("start_timestamp", 0L),
             epochMs = now
         )
+
+    /**
+     * 当前时刻的气压计读数（hPa）：由 [realisticAltitude] 按国际标准大气换算（见 [BarometerModel]）。
+     *
+     * 为什么必须跟海拔走：真机上气压计与 GPS 海拔是两个独立通道，目标应用只要把两条通道对照
+     * 就能发现"GPS 在山上、气压计在海平面"。让气压由同一份海拔算出，两条通道在任何时刻都自洽；
+     * 而气压本身又带缓慢起伏，不是常数，避免"跨会话完全相同"这一类指纹。
+     */
+    fun realisticPressureHpa(config: JSONObject, now: Long = System.currentTimeMillis()): Double {
+        val altitude = realisticAltitude(config, now)
+        val startTimestamp = config.optLong("start_timestamp", 0L)
+        val elapsedSec = if (startTimestamp > 0L) (now - startTimestamp).coerceAtLeast(0L) / 1000.0 else 0.0
+        return BarometerModel.quantize(BarometerModel.pressureHpa(altitude, startTimestamp, elapsedSec))
+    }
 
     /** 配置里缺少真实度字段（旧版 App 写的配置）时按"关闭 + 不浮动"处理，行为与旧版一致 */
     fun realismSession(config: JSONObject, startTimestamp: Long = config.optLong("start_timestamp", 0L)): MotionRealism.Session =

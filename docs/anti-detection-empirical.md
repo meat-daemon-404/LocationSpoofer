@@ -843,7 +843,32 @@ I LocationSpoofer: [LocationSpoofer] Wi-Fi environment hooks installed
 这是**测试脚手架**而不是产品功能：它存在的理由只是「在没有可靠 root 的设备上也能验证模型」，
 边界写在代码注释里，Release 构建里不可达。
 
-### 12.5 这一步还没做完的事
+### 12.5 上机立刻抓到一个只在真机上才会犯的错
+
+调试兜底一生效，每个 `onSatelliteStatusChanged` 后面都跟着一条：
+
+```
+W LSPosedFramework: Exception in hooker
+W LSPosedFramework: java.lang.UnsupportedOperationException
+W LSPosedFramework: 	at java.util.Collections$UnmodifiableList.set(Collections.java:1548)
+W LSPosedFramework: 	at com.vincenthzr.locationspoofer.xposed.hooks.GnssStatusHookerKt$hookGnssStatus$...
+```
+
+原因：`XposedInterface.Chain.getArgs()` 返回的是 `List`，这里按习惯写成了
+「`chain.args[0] = 伪造值` 然后 `proceed(args)`」，而 Android 15 上这个 List 是
+`Collections.unmodifiableList(...)`——下标赋值直接抛 `UnsupportedOperationException`。
+后果很隐蔽：**整条卫星通道的替换被吞掉，应用看到的仍是真机的真实卫星**，
+而且外层有保护性 Hook 兜住了异常，界面不崩、只在日志里留一行 `W`。
+
+全仓扫过一遍，同样的写法还有一处：`AMapHooker` 的 `setMockEnable`。
+
+修法：新增扩展 `Chain.replaceArg(index, value)`——复制一份实参数组再 `proceed(patched)`，
+不碰上游的只读 List；两处都改用它。
+
+这条是整轮里**唯一一个只有真机/模拟器能发现**的问题：编译过、单测全绿、
+纯函数数值对照也对，但它只在「真的有一个框架在回调你」的时候才暴露。
+
+### 12.6 这一步还没做完的事
 
 - 兜底路径本身没跑通验证（写 JSON → 重启目标进程 → 读回 `[DebugConfig]` 日志）；
 - 有 root 的真机链路（应用发布配置 → 模块收到快照 → 目标应用读到数值）完全没有走过；

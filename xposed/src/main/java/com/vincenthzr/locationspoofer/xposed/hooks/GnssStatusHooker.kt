@@ -87,22 +87,25 @@ internal fun LocationHooker.hookGnssStatus(classLoader: ClassLoader) {
                                 "onSatelliteStatusChanged"
                             ) { innerChain, innerMethod ->
                                 val statusObj = innerChain.args[0]
+                                var replacement: Any? = null
                                 val config = readConfig()
                                 if (config != null && config.optBoolean("active", false)) {
                                     val satCounts = RouteEngine.realisticSatelliteCounts(config)
                                     val enableJitter = config.optBoolean("enable_jitter", true)
-                                    val spoofedStatus = GnssFastMockEngine.getOrCreateSpoofedGnssStatus(
+                                    replacement = GnssFastMockEngine.getOrCreateSpoofedGnssStatus(
                                         classLoader = clazz.classLoader ?: classLoader,
                                         counts = satCounts,
                                         seed = config.optLong("start_timestamp", 0L),
                                         enableJitter = enableJitter,
                                         fallbackOriginalObj = statusObj
                                     )
-                                    if (spoofedStatus != null) {
-                                        innerChain.args[0] = spoofedStatus
-                                    }
                                 }
-                                return@hookAllMethods innerChain.proceed(innerChain.args.toTypedArray())
+                                // 不要写 innerChain.args[0]：Chain.getArgs() 可能是不可变列表（Android 15 实测即如此）
+                                return@hookAllMethods if (replacement != null) {
+                                    innerChain.replaceArg(0, replacement)
+                                } else {
+                                    innerChain.proceed(innerChain.args.toTypedArray())
+                                }
                             }
                         } catch (_: Throwable) {
                         }

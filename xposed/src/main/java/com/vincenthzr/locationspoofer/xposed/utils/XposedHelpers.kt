@@ -325,3 +325,15 @@ object XposedBridge {
     }
 }
 
+/**
+ * 用新的实参调用下游，但不改动 [io.github.libxposed.api.XposedInterface.Chain] 自己的 args。
+ *
+ * `Chain.getArgs()` 返回的是 `List`，而不同实现可能返回不可变列表（Android 15 实测会返回
+ * `Collections$UnmodifiableList`），此时 `args[0] = value` 会抛 `UnsupportedOperationException`，
+ * Hook 整条失效。这里复制一份再 `proceed`，语义等价且不改动上游对象。
+ */
+fun io.github.libxposed.api.XposedInterface.Chain.replaceArg(index: Int, value: Any?): Any? {
+    val patched = ArrayList<Any?>(args)
+    patched[index] = value
+    return proceed(patched.toTypedArray())
+}

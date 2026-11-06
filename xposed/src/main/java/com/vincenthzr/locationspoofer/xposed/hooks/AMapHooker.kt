@@ -282,8 +282,9 @@ internal fun LocationHooker.hookAMapSDK(classLoader: ClassLoader) {
 
             XposedHelpers.hookAllMethods(clientClazz, "setMockEnable") { chain, _ ->
                 val config = readConfig()
+                // 不要写 chain.args[0]：Chain.getArgs() 可能是不可变列表（Android 15 实测即如此）
                 if (config != null && config.optBoolean("active", false) && chain.args.isNotEmpty()) {
-                    chain.args[0] = true
+                    return@hookAllMethods chain.replaceArg(0, true)
                 }
                 return@hookAllMethods chain.proceed(chain.args.toTypedArray())
             }

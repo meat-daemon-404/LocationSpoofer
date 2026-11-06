@@ -1,0 +1,47 @@
+name: Build
+
+# 只做一件事：证明本仓库的源码在干净环境里能从零编出来、纯 JVM 单测能过。
+# 不签名、不发版——发版走 release.yml（需要仓库 secrets 里的签名密钥）。
+# 这个工作流不需要任何 secret，任何人 fork 之后都能跑。
+
+on:
+  push:
+    branches:
+      - main
+      - master
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+          cache: 'gradle'
+
+      - name: Unit tests (core-geo, plain JVM)
+        run: |
+          chmod +x ./gradlew
+          ./gradlew --no-daemon :core-geo:test
+
+      - name: Assemble debug APK (scoped scheme, no signing secrets needed)
+        run: ./gradlew --no-daemon :app:assembleScopedDebug
+
+      - name: Report artifact
+        if: always()
+        run: |
+          find app/build/outputs/apk -name '*.apk' -printf '%p  %s bytes\n' || true

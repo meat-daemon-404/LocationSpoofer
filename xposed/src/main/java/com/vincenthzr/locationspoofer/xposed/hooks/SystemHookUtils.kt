@@ -2,6 +2,9 @@ package com.vincenthzr.locationspoofer.xposed.hooks
 
 import android.annotation.SuppressLint
 import android.os.Binder
+import com.vincenthzr.locationspoofer.xposed.LocationHooker
+import com.vincenthzr.locationspoofer.xposed.utils.LocationAltitudeMetadata
+import com.vincenthzr.locationspoofer.xposed.utils.RouteEngine
 import com.vincenthzr.locationspoofer.xposed.utils.SpoofedMotion
 import com.vincenthzr.locationspoofer.xposed.utils.XposedBridge
 import com.vincenthzr.locationspoofer.xposed.utils.XposedHelpers
@@ -323,7 +326,9 @@ object SystemHookUtils {
                 android.os.SystemClock.elapsedRealtimeNanos()
             )
             try {
-                XposedHelpers.callMethod(locObj, "setVerticalAccuracyMeters", 1.5f)
+                // 垂直精度不能是常量：真机 GNSS 的垂直精度通常是水平的 1.5~2 倍，
+                // 且随定位质量一起变化。这里跟随水平精度走，避免出现跨账号可对齐的定值。
+                XposedHelpers.callMethod(locObj, "setVerticalAccuracyMeters", (accuracy * 1.7f).coerceIn(3.0f, 20.0f))
             } catch (_: Throwable) {}
             try {
                 XposedHelpers.callMethod(locObj, "setSpeedAccuracyMetersPerSecond", 0.3f)
@@ -338,20 +343,31 @@ object SystemHookUtils {
                 XposedHelpers.callMethod(locObj, "setIsFromMockProvider", false)
             } catch (_: Throwable) {}
             try {
-                val extras = XposedHelpers.callMethod(locObj, "getExtras") as? android.os.Bundle
-                if (extras != null) {
-                    extras.remove("mockLocation")
-                    extras.putInt("satellites", 20)
-                    extras.putInt("satellites_in_view", 20)
-                    extras.putInt("satellites_used_in_fix", 18)
-                } else {
-                    val bundle = android.os.Bundle()
-                    bundle.putInt("satellites", 20)
-                    bundle.putInt("satellites_in_view", 20)
-                    bundle.putInt("satellites_used_in_fix", 18)
-                    XposedHelpers.callMethod(locObj, "setExtras", bundle)
+                // 颗数跟随当前配置的三口径模型，不再写死 20/20/18——否则同一个 Location
+                // 的 extras 与 GnssStatus 通道各说一套（这是最容易对齐的跨通道矛盾）。
+                val satCounts = (XposedHelpers.module as? LocationHooker)
+                    ?.readConfig()
+                    ?.let { RouteEngine.realisticSatelliteCounts(it) }
+                if (satCounts != null) {
+                    val extras = XposedHelpers.callMethod(locObj, "getExtras") as? android.os.Bundle
+                    if (extras != null) {
+                        extras.remove("mockLocation")
+                        extras.putInt("satellites", satCounts.usedInFix)
+                        extras.putInt("satellites_in_view", satCounts.inView)
+                        extras.putInt("satellites_visible", satCounts.inView)
+                        extras.putInt("satellites_used_in_fix", satCounts.usedInFix)
+                    } else {
+                        val bundle = android.os.Bundle()
+                        bundle.putInt("satellites", satCounts.usedInFix)
+                        bundle.putInt("satellites_in_view", satCounts.inView)
+                        bundle.putInt("satellites_visible", satCounts.inView)
+                        bundle.putInt("satellites_used_in_fix", satCounts.usedInFix)
+                        XposedHelpers.callMethod(locObj, "setExtras", bundle)
+                    }
                 }
             } catch (_: Throwable) {}
+            // 只覆盖椭球高会留下真实设备的 MSL 海拔，两条通道又对不上，统一清掉
+            LocationAltitudeMetadata.clear(locObj)
         } catch (_: Throwable) {}
     }
 

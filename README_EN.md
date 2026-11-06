@@ -84,6 +84,8 @@ Real GPS receivers naturally output coordinates with Gaussian white noise caused
 
 * **Altitude & Accuracy (GDOP) Drift**: Horizontal accuracy and altitude fluctuate dynamically to simulate changing satellite geometries and tropospheric delays.
 
+* **Ellipsoid Height and MSL Height Stay Consistent**: On API 34+ a modified `Location` still carries the device's real MSL altitude (geoid height) unless it is stripped, leaving one forged field next to one genuine one. The MSL metadata is cleared through `removeMslAltitude*`, and vertical accuracy now tracks horizontal accuracy instead of being a fixed constant.
+
 ### 3. Anti-Detection & MultiDex Hooking
 * **Deep Stack Trace Scrubbing**: Dynamically filters `Throwable.getStackTrace` and `Thread.getStackTrace` to expunge calling frames matching `de.robv.android.xposed`, `io.github.libxposed`, `org.lsposed`, preventing anti-cheat SDKs from discovering hook frameworks in exception traces.
 * **ClassLoader Isolation**: Hooks `Class.forName` and `ClassLoader.loadClass` to return `ClassNotFoundException` upon probing for known Xposed classes.

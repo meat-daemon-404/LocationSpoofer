@@ -9,8 +9,8 @@
 
 一句话结论：**抓到的从来不是 `isFromMockProvider`，而是同一个物理量在不同通道上对不上。**
 
-> 落地状态：§1、§2、§3、§4.1、§4.2、§4.3、§4.5、§4.6、§5、§6 已全部实现，全量编译通过，
-> `core-geo` 单元测试 52 项 + `xposed` 25 项全绿；另有 §4.4 两条已知边界未改
+> 落地状态：§1、§2、§3、§4.1、§4.2、§4.3、§4.5、§4.6、§4.7、§5、§6 已全部实现，全量编译通过，
+> `core-geo` 单元测试 52 项 + `xposed` 28 项全绿；另有 §4.4 两条已知边界未改
 > （基准海拔缺省值与静止位置精确，都需要产品决策）。
 > 验证边界见文末「本次改动的验证边界」。
 
@@ -388,6 +388,56 @@ GPS 1-32 / GLONASS 1-24 / Galileo 1-36），每颗卫星的仰角/方位漂移�
 * 没做温度通道（`TYPE_AMBIENT_TEMPERATURE`），真机气压计通常同时暴露温度；
 * 虚拟气压计的传感器名/厂商是固定的 `Pressure Sensor / Android`，与真实设备型号无关。
 
+### 4.7 海拔只覆盖了椭球高，海拔高还是真实值（已实施）
+
+`Location.getAltitude()` 报的是**椭球高**（WGS-84 椭球面之上的高度）；Android 14（API 34）起另有一组
+`hasMslAltitude()` / `getMslAltitudeMeters()`，报的是**海拔高**（大地水准面之上）。真机 GNSS 定位两者
+同时带，差值就是当地的大地水准面差距——在中国境内大致是 −10 ~ +40 m 量级，随位置变化。
+**两者本就该一起动，只改一个反而给了对方一个参照物。**
+
+原来的做法只改前者：
+
+| 路径 | 原状 |
+|---|---|
+| 新建 `Location`（`buildFakeLocation`） | 从头构造，不带 MSL 字段——属于「缺失」，相对安全 |
+| 就地改写既有 `Location`（`applyFakeLocationFields`，7 个调用点） | 保留系统填进去的**真实 MSL**，于是同一个对象上「椭球高是模拟值、海拔高是真实值」 |
+| Google 融合定位（`GoogleAndAddressHooker` 的 `onLocationResult` / `onSuccess`） | 只改坐标，**海拔根本没改**，连椭球高都还是真实设备的 |
+
+改法：**不设，统一清。** 没有大地水准面模型，硬编一个 MSL 值只会引入新的错误差值；而「模拟定位没有
+MSL」在多数场景下反而与普通网络定位一致（网络定位通常不带 MSL）。实现是一个最小反射工具：
+
+```kotlin
+internal object LocationAltitudeMetadata {
+    private val CLEAR_METHODS = arrayOf("removeMslAltitude", "removeMslAltitudeAccuracy")
+    fun clear(location: Any?) {
+        if (location == null) return
+        for (name in CLEAR_METHODS) {
+            try { location.javaClass.getMethod(name).invoke(location) } catch (_: Throwable) {}
+        }
+    }
+}
+```
+
+用反射而不是直接调用：API 34 以下没有这两个方法，反射保证编译期与运行期都不受影响。
+
+落点选公共咽喉：`applyFakeLocationFields` 末尾统一清一次，覆盖它的 7 个调用点；另外 4 处就地改写
+（`GoogleAndAddressHooker` 2 处、`LocationProviderHooker` 2 处）各自补一次。ColorOS 16 原本自己清
+（`removeMslAltitude`），现在统一由公共咽喉处理，那条路径上的重复调用已删掉。
+
+顺带修掉同一个函数里的两个常量：
+
+* `setVerticalAccuracyMeters(1.5f)` → `(accuracy * 1.7f).coerceIn(3.0, 20.0)`。真机垂直精度通常是水平精度的
+  1.5~2 倍，并随水平精度一起变；写死 1.5 等于全设备同一个数，而且是这个函数里唯一没跟随精度的字段。
+* extras 里的 `satellites=20 / satellites_in_view=20 / satellites_used_in_fix=18` → 改用 §4.5 的三口径模型。
+  原来那组数既是常量，又与 `GnssStatus` 通道报的颗数不同源，是这轮里最容易对齐的跨通道矛盾。
+
+验证：`xposed` 新增 3 项单测——带两个 MSL 方法的对象（两个都被调用）、不带任何相关方法的对象
+（不误伤其它方法）、只有其中一个方法的对象（仍被调用），外加 `clear(null)` 与 `clear(Any())` 不抛异常。
+
+诚实边界：`removeMslAltitude` 是 API 34 才有的接口，Android 13 及以下本来就没有这个字段，清与不清
+没有区别；另外在 API 34+ 上「系统 GNSS 定位却完全没有 MSL」本身也是一种可探测特征——只是在
+「有 MSL 但数值是真机的」与「没有 MSL」之间，后者暴露的信息更少。
+
 ---
 
 ## 5. 精度：原范围偏乐观（已实施：放宽基准，加慢变分量）
@@ -505,6 +555,7 @@ nextDispatchMs += dispatchPeriodMs
 | P1 | 卫星数是跨通道对不上的常量 | `SatelliteModel` + `RouteEngine.realisticSatelliteCounts()` | `used_in_fix ≤ visible ≤ in_view` 恒成立；1 小时内取值不止一种 | 已实施 |
 | P2 | 卫星 ID 集合与天顶几何全员相同 | `SatelliteModel.sky()` + `GnssFastMockEngine` | 不同会话的 SVID 集合与仰角不相等；三条通道同源 | 已实施 |
 | P1 | 气压计通道完全没做 | `BarometerModel` + `RouteEngine.realisticPressureHpa()` + `SensorStepHooker` | 气压与 GPS 海拔自洽（反算偏差 < 5 m）；1 小时读数不止一种；静止时不断流 | 已实施 |
+| P1 | 就地改写只覆盖椭球高，MSL 海拔仍是真实值 | `LocationAltitudeMetadata` + `applyFakeLocationFields` | 同一 `Location` 上椭球高与 MSL 不出现「一真一假」；Google 融合定位路径不再漏改海拔 | 已实施 |
 | P2 | 基准海拔缺省 0 导致全员海平面 | `SettingsManager.kt:129` / `LocationRepository` | 不出现跨账号的同一基准值 | 未改（需产品决策，见 §4.4） |
 | P2 | 静止时位置精确等于配置坐标 | `LocationHooker` `isStationary` 分支 | 静止时仍有亚米级漂移 | 未改（见 §4.4） |
 
@@ -512,26 +563,27 @@ nextDispatchMs += dispatchPeriodMs
 
 ## 11. 本次改动的验证边界
 
-本仓库这一轮改了 12 项（§1、§2、§3、§4.1、§4.2、§4.3、§4.5 卫星数与天空几何、§4.6 气压计、§5、§6、计步初值），
-**都没有打 APK、没有上真机**。按验证强度分六类：
+本仓库这一轮改了 13 项（§1、§2、§3、§4.1、§4.2、§4.3、§4.5 卫星数与天空几何、§4.6 气压计、
+§4.7 MSL 海拔与垂直精度、§5、§6、计步初值），
+**都没有打 APK、没有上真机**。按验证强度分七类：
 
 
 **① 全量编译（`core-geo` + `xposed`）**
 
-- 用 `kotlin-compiler-embeddable 2.0.0` 直接以命令行编译两个模块的全部 70 个 Kotlin 源文件
+- 用 `kotlin-compiler-embeddable 2.0.0` 直接以命令行编译两个模块的全部 71 个 Kotlin 源文件
   加 1 份 `BuildConfig` 桩（classpath = `android-34/android.jar` + libxposed API jar），
-  产出 366 个 class，**退出码 0、无错误**。
+  产出 367 个 class，**退出码 0、无错误**。
 - `core-geo` 用到的 `BuildConfig` 需要一份桩（真 BuildConfig 由 flavor 生成），
   桩只要 `const val GLOBAL_SCHEME: Boolean`。
 - `app-ui` / `core-data` / `service` 三个模块的 Compose、高德/百度 Maps 依赖在本机拿不到，
   没有本地编译；它们的编译由仓库的 `build` 工作流在 CI 上兜（`assembleScopedDebug`）。
 
-**② 单元测试（`core-geo` 9 个测试类、52 项 + `xposed` 25 项）**
+**② 单元测试（`core-geo` 9 个测试类、52 项 + `xposed` 5 个测试类、28 项）**
 
 - 同样绕开 Gradle：编译 `core-geo/src/test` + JUnit 4.13.2 + hamcrest-core 1.3，
   用 `org.junit.runner.JUnitCore` 直接跑 → **OK (52 tests)**。
 - `xposed` 侧同样方式跑 `RouteEngineTest` / `HotReloadHostTest` / `VendorRegistryTest` /
-  `ColorOs16VendorTest` → **OK (25 tests)**，其中包含两条既有断言：
+  `ColorOs16VendorTest` / `LocationAltitudeMetadataTest` → **OK (28 tests)**，其中包含两条既有断言：
   显式 `altitude_variation_m = 0` 时海拔恒为基准值（`assertEquals(80.0, …, 0.0)`），
   以及老配置（不写该键）落在 `base ± drift` 区间内。这两条是 §4.1 改动的回归护栏。
 - §4.5 的卫星数在两侧都有护栏：`SatelliteModelTest` 9 项（区间、包含关系、时间起伏、
@@ -542,6 +594,8 @@ nextDispatchMs += dispatchPeriodMs
 - §4.6 的气压通道两侧同样有护栏：`BarometerModelTest` 7 项（海平面基准、海拔单调性、
   低空梯度、往返换算、时间起伏、跨场次分散、量程夹断、量化步进），`RouteEngineTest` 里
   1 项从配置 JSON 走完整链路，断言「气压换算回的海拔」与「GPS 海拔」相差不超过一个量化步进。
+- §4.7 的 MSL 清理有 3 项单测，覆盖「两个方法都有 / 一个都没有 / 只有其中一个」三种对象，
+  外加 `null` 与无关对象不得抛异常。
 
 **③ 自建测量用例（bearing 差分）**
 
@@ -595,6 +649,7 @@ nextDispatchMs += dispatchPeriodMs
 不同 ROM 下 `TYPE_STEP_DETECTOR` 的实际投递节奏、`Thread.sleep` 网格在真机上的实际抖动
 （§6 的 996/1004 ms 来自另一套独立实现的外部实测，不是本仓库测的）、
 虚拟 `TYPE_PRESSURE` 传感器能否被目标应用正常枚举、
+`removeMslAltitude` 在真机 Location 对象上的实际可用性（反射失败会静默跳过）、
 以及 ColorOS 16 适配路径的实机命中情况。
 
 
@@ -623,3 +678,9 @@ nextDispatchMs += dispatchPeriodMs
    `Location.getAltitude()` 比——差值应在一个量化步进到几米之间，不能是"气压在海平面、
    GPS 在山上"这种量级差。再静止不动 5 分钟，读数应仍有小幅变化（真机气压计不会跳数停摆）。
    设备本身没有气压计时，确认目标应用枚举到的是我们注入的虚拟气压计，且关掉开关后它消失。
+10. **海拔高与椭球高同源**：API 34+ 上同一时刻读 `Location.hasMslAltitude()` / `getMslAltitudeMeters()`
+    与 `getAltitude()`——不能让「椭球高是模拟值、海拔高还是设备真实值」同时出现在一个对象里。
+    再确认 `hasVerticalAccuracy()` 的字段不是恒定值（真机随定位质量变化）。
+11. **卫星 extras 与 GnssStatus 同源**：同一时刻取 `Location.extras` 的
+    `satellites / satellites_in_view / satellites_used_in_fix`，与 `GnssStatus` 里
+    `usedInFix` 的颗数对比——两处必须相等，不能各说一套。

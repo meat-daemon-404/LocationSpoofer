@@ -141,6 +141,10 @@ internal fun LocationHooker.hookGoogleFusedLocation(classLoader: ClassLoader) {
                                                     loc.accuracy = getJitteredAccuracy()
                                                     loc.speed = motion.speed
                                                     loc.bearing = motion.bearing
+                                                    // 原来这条路径只改了经纬度，海拔仍是真实设备的：
+                                                    // 融合定位给目标应用的是一个「在某处、但在原高度」的位置。
+                                                    loc.altitude = RouteEngine.realisticAltitude(config)
+                                                    LocationAltitudeMetadata.clear(loc)
                                                     loc.time = System.currentTimeMillis()
                                                     loc.elapsedRealtimeNanos =
                                                         android.os.SystemClock.elapsedRealtimeNanos()
@@ -181,6 +185,8 @@ internal fun LocationHooker.hookGoogleFusedLocation(classLoader: ClassLoader) {
                             result.latitude = motion.lat
                             result.longitude = motion.lng
                             result.accuracy = getJitteredAccuracy()
+                            result.altitude = RouteEngine.realisticAltitude(config)
+                            LocationAltitudeMetadata.clear(result)
                             result.time = System.currentTimeMillis()
                             result.elapsedRealtimeNanos = android.os.SystemClock.elapsedRealtimeNanos()
                         }

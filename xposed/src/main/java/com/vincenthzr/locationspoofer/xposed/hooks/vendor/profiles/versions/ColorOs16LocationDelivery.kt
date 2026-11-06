@@ -243,8 +243,6 @@ internal class ColorOs16LocationDelivery(
             SystemHookUtils.applyFakeLocationFields(
                 location, motion, RouteEngine.realisticAltitude(config), module.getJitteredAccuracy()
             )
-            location.removeMslAltitude()
-            location.removeMslAltitudeAccuracy()
             applySatelliteExtras(location, config)
         }
         return copy

@@ -213,6 +213,7 @@ internal fun LocationHooker.hookLocationProviders(classLoader: ClassLoader, curr
                                                             firstArg.speed = motion.speed
                                                             firstArg.bearing = motion.bearing
                                                             firstArg.altitude = RouteEngine.realisticAltitude(config)
+                                                            LocationAltitudeMetadata.clear(firstArg)
                                                             firstArg.time = System.currentTimeMillis()
                                                             firstArg.elapsedRealtimeNanos = android.os.SystemClock.elapsedRealtimeNanos()
                                                             try {
@@ -248,6 +249,7 @@ internal fun LocationHooker.hookLocationProviders(classLoader: ClassLoader, curr
                                                                     loc.speed = motion.speed
                                                                     loc.bearing = motion.bearing
                                                                     loc.altitude = RouteEngine.realisticAltitude(config)
+                                                                    LocationAltitudeMetadata.clear(loc)
                                                                     loc.time = System.currentTimeMillis()
                                                                     loc.elapsedRealtimeNanos = android.os.SystemClock.elapsedRealtimeNanos()
                                                                     try {

@@ -85,6 +85,8 @@
 
 * **高度（Altitude）与精度（Accuracy）慢漂移**：精度值与海拔高度动态波动，模拟大气对流层延迟与卫星几何分布的自然变化。
 
+* **椭球高与海拔高同源**：不改 `Location` 时，API 34+ 上的 MSL 海拔（大地水准面高）会残留设备真实值，与伪造的椭球高形成「一真一假」的参照——统一清掉 `removeMslAltitude*`，并把垂直精度改为跟随水平精度变化，不再写死一个常量。
+
 ### 3. 反检测与 MultiDex 支持
 * **调用栈深度清洗（Stack Traces Scrubbing）**：拦截 `Throwable.getStackTrace` 和 `Thread.getStackTrace`，自动过滤移除包含 `de.robv.android.xposed`、`io.github.libxposed`、`org.lsposed` 等特征调用帧，阻止反作弊 SDK 在异常堆栈回溯中嗅探 Hook 框架。
 * **类加载器探测隔离**：拦截 `Class.forName` 和 `ClassLoader.loadClass`，对 Xposed 特征类名的探测统一返回 `ClassNotFoundException`。

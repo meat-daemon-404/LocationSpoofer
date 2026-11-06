@@ -1,4 +1,4 @@
-﻿# 反检测实测提要
+# 反检测实测提要
 
 本文不是设计文档，是把一个**已经跑了几十场、并被真实判定链路处理过**的模拟定位场景里，
 用落盘数据能直接量出来的东西，逐条对到本仓库的代码上。
@@ -9,8 +9,8 @@
 
 一句话结论：**抓到的从来不是 `isFromMockProvider`，而是同一个物理量在不同通道上对不上。**
 
-> 落地状态：§1、§2、§3、§4.1、§4.2、§4.3、§4.5、§4.6、§4.7、§4.8、§5、§6 已全部实现，全量编译通过，
-> `core-geo` 单元测试 52 项 + `xposed` 29 项全绿；另有 §4.4 两条已知边界未改
+> 落地状态：§1、§2、§3、§4.1、§4.2、§4.3、§4.5、§4.6、§4.7、§4.8、§4.9、§5、§6 已全部实现，全量编译通过，
+> `core-geo` 单元测试 64 项 + `xposed` 29 项全绿；另有 §4.4 两条已知边界未改
 > （基准海拔缺省值与静止位置精确，都需要产品决策）。
 > 验证边界见文末「本次改动的验证边界」。
 
@@ -457,6 +457,83 @@ internal object LocationAltitudeMetadata {
 诚实边界：TTFF 与「实际等了多久」没有关系——我们在注册后立即派发，真机是等若干秒才首个 fix。
 这一条只消除了「数值本身是常量/跨通道不一致」，没有改派发时序（那会改变应用的等待行为，需要单独评估）。
 
+### 4.9 NMEA 的 GSV/GSA 根本没改写（已实施）
+
+这是同一类问题的另一面，但更直接：**GSV/GSA 里带着真实的卫星编号**。
+
+#### 原状
+
+`NmeaSpoofing` 只改 `GGA`/`RMC`/`GLL` 的坐标与时间，`GSV`/`GSA` 原样放行。于是：
+
+| 通道 | 内容 | 来源 |
+|---|---|---|
+| `GGA` 第 8 字段 | 我们伪造的参与解算颗数（`SatelliteModel`） | 伪造 |
+| `GSV` | 每颗卫星的 **PRN、仰角、方位、信噪比** | **真实星座** |
+| `GSA` | 参与解算的 **PRN 列表** 与 PDOP/HDOP/VDOP | **真实值** |
+
+任何解析 NMEA 的应用（地图、导航、轨迹、打车、以及各种反作弊 SDK）都能直接读到「当前看到的是哪几颗
+真卫星、它们在天上的哪个方位、信噪比多少」。这不是「数值可疑」，是**把真实观测原样交了底**；而 `GGA`
+里的颗数还是我们编的，两条信息一对就露。
+
+#### 改法：整条重建，不用真机的数字
+
+新文件 `core-geo/.../NmeaRewrite.kt` 负责把「一份卫星快照」翻译成合法的 NMEA 报文：
+
+* `satellites(sky)` 把 `SatelliteModel.Sky` 转成带 PRN 的卫星表；信噪比沿用 GnssStatus 通道的
+  同一条算式 `34 + 仰角/90*8`，落到 30~43 dB-Hz —— **两条通道对同一颗卫星给出同一个信噪比**。
+* `gsvSentence(...)` 按每页 4 颗分页重建 `$XXGSV,总页数,页号,视野内总数,prn,仰角,方位,信噪比,...*校验`。
+* `gsaSentence(...)` 重建 `$XXGSA,A,3,` + 12 个 PRN 槽位 + 三个 DOP；空槽留空（这是合法写法）。
+* `dopFromAccuracy(accuracyM)` 让 DOP 与 `Location.getAccuracy()` 同源：
+  `hdop = 精度/5`（夹 0.6~6.0）、`vdop = hdop*1.7`（夹 1~10）、`pdop = √(hdop²+vdop²)`。
+  原来是写死的 `0.8`/`1.2,0.8,0.9`。
+* 卫星号来自 `core-geo/.../SatelliteCatalog.kt`（与 GnssStatus 通道**同一份目录**），
+  其中 GLONASS 的 PRN 要 `+64`，落在 65~96 段——直接把星座内编号当 PRN 发出去是常见错法。
+
+#### 两个不改写解决不了的问题，也一起处理了
+
+1. **页数不够**：真机可能只发 1 页 GPS 的 GSV（8 颗），我们这份表需要 3 页。光把头部页数改成 3 是没用的，
+   第 3 页永远不来，任何按页聚合的解析器都停在半个周期上。→ `NmeaRewrite.missingPages(真机总页数, 真机页号, 我们的页数)`
+   算出还差哪几页，由 hook 在真机最后一页之后补发（`NmeaSpoofing.emitMissingGsvPages`）。
+2. **星座缺席**：真机在此刻可能根本不发北斗/GLONASS 的 GSV，而 `GGA` 报的是四个星座合起来的颗数。
+   → 每收到一条 NMEA 报文，就把这一秒还没出现过的星座补齐（`emitPendingConstellationSentences`），
+   并给这一秒做个记账：**已经由我们补出来的星座，真机后面再发同一星座就整条丢弃**，否则同一页会来两次。
+
+补发与丢页都走「`spoofNmeaMessage` 返回 null 即丢弃」和「直接调用目标监听器」两条既有路径，
+不新增注入通道。
+
+#### 顺带修掉的目录问题
+
+原模板把同一星座的槽位排在连续区间里（12 北斗 + 12 GPS + 4 GLONASS + 4 Galileo）。`SatelliteModel.sky()`
+按会话种子取连续窗口，于是某些会话的窗口整段落进一个星座 —— 实测出现过「GPS 只剩 1 颗可见、北斗 12 颗」，
+在亚太也说不通，而且 `GGA` 的颗数与分星座 GSV 的颗数明显失衡。改成四家交错排列后，任何窗口都能取到全部四家。
+
+#### 实测（纯函数探针，`SatelliteModel` + `NmeaRewrite`）
+
+一次会话（种子 42、`inView=22`、`usedInFix=15`）：GPS 9 颗 / 北斗 9 颗 / 每颗都有合法 PRN。
+
+真机只给一页 GPS GSV（真 PRN 5/13/15/18）时，重建后的三页与 `GSA`：
+
+```
+$GPGSV,3,1,09,07,052,169,38,08,027,347,36,09,070,092,40,11,068,198,40*74
+$GPGSV,3,2,09,14,055,303,38,17,030,049,36,19,050,148,38,21,036,270,37*7E
+$GPGSV,3,3,09,22,030,019,36*7E
+$GPGSA,A,3,07,09,11,14,19,21,,,,,,,1.8,0.9,1.6*35
+```
+
+* 真机的 4 个 PRN 一个都没留下；我们的 PRN 全部来自目录。
+* 校验和独立异或复核一致（`61 == 61`）。
+* 5 个不同会话在同一时刻的 GPS 可见集合互不相同（`[1,3,6,7,8,9]` / `[3,6,7,8,9,11,14,17]` / …）。
+* 分星座颗数 **加起来恒等于整份天空**，所以 `GGA` 的「参与解算颗数」不可能超过 `GSV` 里能数出来的
+  「在视野颗数」——单测在 5 个种子 × 3 个时刻上把这个划分性质钉住。
+
+#### 诚实边界
+
+* 只改写了真机**实际发出**的报文；真机连 `GGA`/`GSV` 都不发（只用融合定位、不开放 NMEA）时，这条通道无事可做。
+* 卫星编号仍是固定目录里的那 32 颗（换会话换窗口段，但全体用户共享同一份目录），要进一步去模板化需要
+  与各星座真实的编号规则对齐，收益不明显、风险不小。
+* 仰角/方位来自 `SatelliteModel.sky()` 的正弦演化，与真实星历无关——只要应用不做 TLE 校验就看不出来，
+  做星历校验的（极少数）能看出这不像真实轨道。
+
 ---
 
 ## 5. 精度：原范围偏乐观（已实施：放宽基准，加慢变分量）
@@ -576,6 +653,7 @@ nextDispatchMs += dispatchPeriodMs
 | P1 | 气压计通道完全没做 | `BarometerModel` + `RouteEngine.realisticPressureHpa()` + `SensorStepHooker` | 气压与 GPS 海拔自洽（反算偏差 < 5 m）；1 小时读数不止一种；静止时不断流 | 已实施 |
 | P1 | 就地改写只覆盖椭球高，MSL 海拔仍是真实值 | `LocationAltitudeMetadata` + `applyFakeLocationFields` | 同一 `Location` 上椭球高与 MSL 不出现「一真一假」；Google 融合定位路径不再漏改海拔 | 已实施 |
 | P2 | 首个 fix 耗时写死 1000 ms、两通道不一致 | `RouteEngine.realisticTimeToFirstFixMs()` | 同场次恒定、换场次变化、`onFirstFix` 与 `GpsStatus.mTimeToFirstFix` 同值 | 已实施 |
+| P1 | NMEA 的 GSV/GSA 原样放行，真实卫星号/几何/DOP 全泄露 | `NmeaRewrite` + `SatelliteCatalog` + `NmeaSpoofing` | GSV 里出现的 PRN 全部来自目录；三页拼起来无重复；GGA 颗数 ≤ GSV 数出来的在视野颗数 | 已实施 |
 | P2 | 基准海拔缺省 0 导致全员海平面 | `SettingsManager.kt:129` / `LocationRepository` | 不出现跨账号的同一基准值 | 未改（需产品决策，见 §4.4） |
 | P2 | 静止时位置精确等于配置坐标 | `LocationHooker` `isStationary` 分支 | 静止时仍有亚米级漂移 | 未改（见 §4.4） |
 
@@ -583,25 +661,25 @@ nextDispatchMs += dispatchPeriodMs
 
 ## 11. 本次改动的验证边界
 
-本仓库这一轮改了 14 项（§1、§2、§3、§4.1、§4.2、§4.3、§4.5 卫星数与天空几何、§4.6 气压计、
-§4.7 MSL 海拔与垂直精度、§4.8 首个 fix 耗时、§5、§6、计步初值），
-**都没有打 APK、没有上真机**。按验证强度分七类：
+本仓库这一轮改了 15 项（§1、§2、§3、§4.1、§4.2、§4.3、§4.5 卫星数与天空几何、§4.6 气压计、
+§4.7 MSL 海拔与垂直精度、§4.8 首个 fix 耗时、§4.9 NMEA 的 GSV/GSA、§5、§6、计步初值），
+**都没有打 APK、没有上真机**。按验证强度分八类：
 
 
 **① 全量编译（`core-geo` + `xposed`）**
 
-- 用 `kotlin-compiler-embeddable 2.0.0` 直接以命令行编译两个模块的全部 71 个 Kotlin 源文件
+- 用 `kotlin-compiler-embeddable 2.0.0` 直接以命令行编译两个模块的全部 73 个 Kotlin 源文件
   加 1 份 `BuildConfig` 桩（classpath = `android-34/android.jar` + libxposed API jar），
-  产出 367 个 class，**退出码 0、无错误**。
+  产出 372 个 class，**退出码 0、无错误**。
 - `core-geo` 用到的 `BuildConfig` 需要一份桩（真 BuildConfig 由 flavor 生成），
   桩只要 `const val GLOBAL_SCHEME: Boolean`。
 - `app-ui` / `core-data` / `service` 三个模块的 Compose、高德/百度 Maps 依赖在本机拿不到，
   没有本地编译；它们的编译由仓库的 `build` 工作流在 CI 上兜（`assembleScopedDebug`）。
 
-**② 单元测试（`core-geo` 9 个测试类、52 项 + `xposed` 5 个测试类、29 项）**
+**② 单元测试（`core-geo` 10 个测试类、64 项 + `xposed` 5 个测试类、29 项）**
 
 - 同样绕开 Gradle：编译 `core-geo/src/test` + JUnit 4.13.2 + hamcrest-core 1.3，
-  用 `org.junit.runner.JUnitCore` 直接跑 → **OK (52 tests)**。
+  用 `org.junit.runner.JUnitCore` 直接跑 → **OK (64 tests)**。
 - `xposed` 侧同样方式跑 `RouteEngineTest` / `HotReloadHostTest` / `VendorRegistryTest` /
   `ColorOs16VendorTest` / `LocationAltitudeMetadataTest` → **OK (29 tests)**，其中包含两条既有断言：
   显式 `altitude_variation_m = 0` 时海拔恒为基准值（`assertEquals(80.0, …, 0.0)`），
@@ -616,6 +694,11 @@ nextDispatchMs += dispatchPeriodMs
   1 项从配置 JSON 走完整链路，断言「气压换算回的海拔」与「GPS 海拔」相差不超过一个量化步进。
 - §4.7 的 MSL 清理有 3 项单测，覆盖「两个方法都有 / 一个都没有 / 只有其中一个」三种对象，
   外加 `null` 与无关对象不得抛异常。
+- §4.9 的 NMEA 重建有 12 项单测：分页覆盖每颗卫星且头部字段正确、卫星不足时不留空页、
+  校验和独立异或复核、GLONASS 的 PRN 落在 65~96、`ofTalker` 只留该星座、GSA 最多 12 颗且
+  DOP 满足勾股关系、空槽留空、DOP 随精度单调且 VDOP>HDOP、各字段落在 NMEA 允许的整数范围、
+  `missingPages` 只在真机最后一页后才补、补出来的页与前面的页拼起来不重复，
+  以及「四个前缀的颗数加起来等于整份天空」这条划分性质（5 个种子 × 3 个时刻）。
 
 **③ 自建测量用例（bearing 差分）**
 
@@ -665,6 +748,17 @@ nextDispatchMs += dispatchPeriodMs
   应有的表现，不是每帧乱跳。
 - ISA 基准点自检：0 m → 1013.25 hPa、100 m → 1001.30 hPa、1000 m → 898.76 hPa。
 
+**⑧ 数值对照（NMEA 报文重建，纯函数）**
+
+- 一次会话（`seed=42`、`inView=22`、`usedInFix=15`）分星座为 GPS 9 颗 / 北斗 9 颗，
+  真机给的 `PRN 5/13/15/18` 一个都没留下。
+- 真机只念 1 页 GPS 的 GSV 时，重建后是 3 页（`,3,1,09,…` / `,3,2,09,…` / `,3,3,09,…`），
+  三页拼起来正好 9 颗、无重复；`GSA` 的 12 个 PRN 槽位里前 6 个有值、其余留空。
+- 校验和独立异或复核一致（`61 == 61`）。
+- 5 个不同场次同一时刻的 GPS 可见集合互不相同（`[1,3,6,7,8,9]` / `[3,6,7,8,9,11,14,17]` / …）。
+- 这一节证明的是「报文本身合法、内部自洽、不是真机那份」，**不证明目标应用真的会走这条通道**——
+  多数应用直接用 `Location`/`GnssStatus`，只有解析 NMEA 的才看得到。
+
 **仍然不能确定的是真机运行时行为**：反射构造 `SensorEvent` 的三条 fallback 路径、
 不同 ROM 下 `TYPE_STEP_DETECTOR` 的实际投递节奏、`Thread.sleep` 网格在真机上的实际抖动
 （§6 的 996/1004 ms 来自另一套独立实现的外部实测，不是本仓库测的）、
@@ -707,3 +801,8 @@ nextDispatchMs += dispatchPeriodMs
 12. **卫星 extras 与 GnssStatus 同源**：同一时刻取 `Location.extras` 的
     `satellites / satellites_in_view / satellites_used_in_fix`，与 `GnssStatus` 里
     `usedInFix` 的颗数对比——两处必须相等，不能各说一套。
+13. **NMEA 里没有真卫星**：注册 `OnNmeaMessageListener`，把收到的 `GSV` 全部收集起来，
+    比对两件事——① 出现的 PRN 集合与真实设备开定位时记录的 PRN 集合**没有交集**；
+    ② 各星座 GSV 里数出来的颗数加起来 ≥ 同一时刻 `GGA` 第 8 字段的颗数。
+    再确认同一秒内 `GSV` 的「总页数/页号」能完整走完一圈（没有永远等不到的那一页），
+    以及不同星座的 `GSV` 不会被同一页发两遍。

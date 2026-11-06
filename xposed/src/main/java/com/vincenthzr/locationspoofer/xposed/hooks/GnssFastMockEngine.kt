@@ -1,5 +1,6 @@
 package com.vincenthzr.locationspoofer.xposed.hooks
 
+import com.vincenthzr.locationspoofer.utils.SatelliteCatalog
 import com.vincenthzr.locationspoofer.utils.SatelliteModel
 import com.vincenthzr.locationspoofer.xposed.utils.XposedBridge
 import com.vincenthzr.locationspoofer.xposed.utils.XposedHelpers
@@ -20,45 +21,6 @@ import java.util.concurrent.ConcurrentHashMap
 object GnssFastMockEngine {
 
     private const val MAX_SATELLITES = 32
-
-    // 预置可信多星座模板 (GPS=1, GLONASS=3, BDS=5, GALILEO=6)
-    private val CONSTELLATION_TYPES = intArrayOf(
-        // BDS (北斗) - 亚太区域主力
-        5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5,
-        // GPS
-        1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
-        // GLONASS
-        3, 3, 3, 3,
-        // Galileo
-        6, 6, 6, 6
-    )
-
-    private val SVID_LIST = intArrayOf(
-        // BDS SVIDs (1-35)
-        1, 2, 3, 5, 6, 7, 8, 9, 10, 11, 13, 14,
-        // GPS SVIDs (1-32)
-        1, 3, 6, 7, 8, 9, 11, 14, 17, 19, 21, 22,
-        // GLONASS SVIDs (1-24)
-        1, 2, 3, 4,
-        // Galileo SVIDs (1-36)
-        1, 2, 3, 5
-    )
-
-    // 预置基准仰角 (度)
-    private val BASE_ELEVATIONS = floatArrayOf(
-        78f, 65f, 54f, 42f, 38f, 72f, 58f, 49f, 33f, 61f, 45f, 29f,
-        82f, 69f, 51f, 44f, 36f, 75f, 63f, 47f, 31f, 59f, 41f, 25f,
-        55f, 43f, 35f, 28f,
-        60f, 48f, 39f, 22f
-    )
-
-    // 预置基准方位角 (度)
-    private val BASE_AZIMUTHS = floatArrayOf(
-        12f, 45f, 78f, 112f, 145f, 178f, 212f, 245f, 278f, 312f, 335f, 25f,
-        35f, 68f, 95f, 132f, 165f, 198f, 232f, 265f, 298f, 325f, 15f, 52f,
-        85f, 175f, 265f, 345f,
-        45f, 135f, 225f, 315f
-    )
 
     // 预置平滑微扰动表 (循环索引，避免 Math.random() 开销)
     private val JITTER_TABLE = floatArrayOf(
@@ -214,7 +176,7 @@ object GnssFastMockEngine {
     fun buildSvArrays(counts: SatelliteModel.Counts, seed: Long, enableJitter: Boolean = true): SvArrays {
         val now = System.currentTimeMillis()
         val timeStep = (now / 1000L).toInt()
-        val sky = SatelliteModel.sky(counts, seed, now, BASE_ELEVATIONS, BASE_AZIMUTHS)
+        val sky = SatelliteModel.sky(counts, seed, now, SatelliteCatalog.BASE_ELEVATIONS, SatelliteCatalog.BASE_AZIMUTHS)
         val n = sky.size
         val svidWithFlags = IntArray(n)
         val cn0DbHz = FloatArray(n)
@@ -223,12 +185,12 @@ object GnssFastMockEngine {
         val carrierFrequencies = FloatArray(n)
         for (i in 0 until n) {
             val slot = sky.slot[i]
-            val type = CONSTELLATION_TYPES[slot]
+            val type = SatelliteCatalog.CONSTELLATION_TYPES[slot]
             val elevation = sky.elevations[i]
             val jitter = if (enableJitter) JITTER_TABLE[(timeStep + i) and 15] else 0f
             val cn0 = (34f + (elevation / 90f) * 8f + jitter).coerceIn(30f, 43.5f)
             // 低 8 位标志: 0x1 有历书 / 0x2 有星历 / 0x4 参与定位解算
-            svidWithFlags[i] = (SVID_LIST[slot] shl 4) or 0x03 or (if (sky.usedInFix[i]) 0x04 else 0)
+            svidWithFlags[i] = (SatelliteCatalog.SVIDS[slot] shl 4) or 0x03 or (if (sky.usedInFix[i]) 0x04 else 0)
             cn0DbHz[i] = cn0
             elevations[i] = elevation
             azimuths[i] = sky.azimuths[i]
@@ -270,7 +232,7 @@ object GnssFastMockEngine {
             val holder = getReflectionHolder(classLoader)
             val timeStep = (now / 1000L)
             // 星座天顶分布与卫星计数共用同一份模型：数量、仰角、是否参与解算互相自洽
-            val sky = SatelliteModel.sky(counts, seed, now, BASE_ELEVATIONS, BASE_AZIMUTHS)
+            val sky = SatelliteModel.sky(counts, seed, now, SatelliteCatalog.BASE_ELEVATIONS, SatelliteCatalog.BASE_AZIMUTHS)
 
             // 方案 A: Android 11+ Builder 极速构建 (全反射句柄已缓存)
             if (holder.builderConstructor != null && holder.addSatelliteMethod != null && holder.buildMethod != null) {
@@ -280,8 +242,8 @@ object GnssFastMockEngine {
 
                     for (i in 0 until sky.size) {
                         val slot = sky.slot[i]
-                        val type = CONSTELLATION_TYPES[slot]
-                        val svid = SVID_LIST[slot]
+                        val type = SatelliteCatalog.CONSTELLATION_TYPES[slot]
+                        val svid = SatelliteCatalog.SVIDS[slot]
                         val elevation = sky.elevations[i]
                         val azimuth = sky.azimuths[i]
 
@@ -341,8 +303,8 @@ object GnssFastMockEngine {
 
                     for (i in 0 until sky.size) {
                         val slot = sky.slot[i]
-                        val type = CONSTELLATION_TYPES[slot]
-                        val svid = SVID_LIST[slot]
+                        val type = SatelliteCatalog.CONSTELLATION_TYPES[slot]
+                        val svid = SatelliteCatalog.SVIDS[slot]
                         val elevation = sky.elevations[i]
                         val azimuth = sky.azimuths[i]
                         val jitter = if (enableJitter) JITTER_TABLE[(timeStep.toInt() + i) and 15] else 0f
@@ -411,14 +373,14 @@ object GnssFastMockEngine {
             }
 
             val timeStep = (now / 1000L)
-            val sky = SatelliteModel.sky(counts, seed, now, BASE_ELEVATIONS, BASE_AZIMUTHS)
+            val sky = SatelliteModel.sky(counts, seed, now, SatelliteCatalog.BASE_ELEVATIONS, SatelliteCatalog.BASE_AZIMUTHS)
             val list = ArrayList<Any>(sky.size)
 
             try {
                 for (i in 0 until sky.size) {
                     val slot = sky.slot[i]
-                    val type = CONSTELLATION_TYPES[slot]
-                    val rawSvid = SVID_LIST[slot]
+                    val type = SatelliteCatalog.CONSTELLATION_TYPES[slot]
+                    val rawSvid = SatelliteCatalog.SVIDS[slot]
                     val prn = if (type == 3) rawSvid + 64 else rawSvid
 
                     val sat = holder.gpsSatelliteConstructor!!.newInstance(prn)

@@ -113,7 +113,7 @@ Real GPS receivers naturally output coordinates with Gaussian white noise caused
 
 ### 5. Satellite Matrix & NMEA Generation
 * **GnssStatus Matrix Injection**: Hooks `GnssStatus` to simulate 20+ active satellites (GPS, BeiDou, GLONASS) with valid PRNs, signal-to-noise ratios (CNR/SNR), azimuths, elevations, and `usedInFix` flags.
-* **Dynamic NMEA Protocol Streaming**: Intercepts `OnNmeaMessageListener` / `GpsStatus.NmeaListener` and dynamically generates compliant raw `$GPGGA`, `$GPRMC`, `$GPGSA`, `$GPGSV` sentences in memory with accurate checksums.
+* **Dynamic NMEA Protocol Streaming**: Intercepts `OnNmeaMessageListener` / `GpsStatus.NmeaListener`. `$GPGGA` / `$GPRMC` / `$GPGLL` are patched in place (position, heading); `$GPGSA` / `$GPGSV` are rebuilt wholesale — PRNs, elevations, azimuths and CNR all come from the same snapshot the `GnssStatus` path uses, DOP is derived from `Location.getAccuracy()`, and checksums are recomputed. When the real receiver emits fewer pages, or does not emit a constellation (BeiDou / GLONASS / Galileo) at all, the missing pages and constellations are filled in so the satellite count in `GGA` can never exceed the in-view count visible in `GSV`.
 * **Satellite Metadata Keep-Alive**: Injects satellite counts into `Location.getExtras()` so map SDKs do not discard a GPS signal for lack of satellite locks. The counts are not hardcoded constants — they drift over time across three consistent figures (visible / in view / used in fix) with `used_in_fix ≤ visible ≤ in_view` always holding.
 
 ### 6. Step Sensor & Motion Simulation

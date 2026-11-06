@@ -118,7 +118,7 @@
 
 ### 5. 卫星矩阵与 NMEA 模拟
 * **GnssStatus 矩阵注入**：Hook 系统的 `GnssStatus` 类，模拟 20+ 颗包括 GPS、北斗、GLONASS 的卫星分布矩阵，注入 PRN 标识、信噪比（CNR）、俯仰角、方位角等，并正确汇报 `usedInFix` 状态。
-* **NMEA 语句流动态拼装**：劫持 `OnNmeaMessageListener` / `GpsStatus.NmeaListener`，根据当前模拟坐标、航向角、速度和卫星信息，动态拼装符合规范的原始 `$GPGGA`, `$GPRMC`, `$GPGSA`, `$GPGSV` 语句并计算校验和（Checksum）输出。
+* **NMEA 语句流动态拼装**：劫持 `OnNmeaMessageListener` / `GpsStatus.NmeaListener`，`$GPGGA` / `$GPRMC` / `$GPGLL` 就地修补坐标与航向；`$GPGSA` / `$GPGSV` 则整条重建——卫星号、仰角、方位、信噪比全部取自与 `GnssStatus` 通道同一份快照，DOP 由 `Location.getAccuracy()` 换算，校验和重算。真机页数不够、或某个星座（北斗 / GLONASS / Galileo）此刻根本没发报文时，会补齐对应的页与星座，保证「`GGA` 报的参与解算颗数」不会大于「`GSV` 里数出来的在视野颗数」（依据见 [docs/anti-detection-empirical.md](docs/anti-detection-empirical.md)）。
 * **卫星元数据保活注入**：向各大地图 SDK 派发 `Location` 时在 `getExtras()` 里注入卫星颗数，防止定位 SDK 判定无卫星搜星而丢弃 GPS 信号。颗数不是写死的常量，而是按「可见 / 在视野 / 参与解算」三口径随时间起伏，且满足 `used_in_fix ≤ visible ≤ in_view`（依据见 [docs/anti-detection-empirical.md](docs/anti-detection-empirical.md)）。
 
 ### 6. 传感器与步频模拟

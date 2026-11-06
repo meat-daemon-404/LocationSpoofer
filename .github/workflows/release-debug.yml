@@ -46,12 +46,18 @@ jobs:
           cache: 'gradle'
 
       - name: Build debug APKs
+        env:
+          # GitHub 的 ubuntu runner 默认给 Gradle daemon 只有 512 MiB 堆，
+          # 编 app 变体（Compose + 三套地图 SDK）时会 OutOfMemoryError 并让 daemon 卡死，
+          # 中途没有任何输出。显式抬到 4 GiB，并禁用 daemon 让内存随进程释放。
+          GRADLE_OPTS: "-Dorg.gradle.jvmargs=-Xmx4g -Dorg.gradle.daemon=false"
+          JAVA_TOOL_OPTIONS: "-Xmx4g"
         run: |
           chmod +x ./gradlew
           # 两种模拟方案分开打包：同一次调用里并行打包多个变体 × ABI 拆分时，
           # AGP 的签名摘要任务会和打包写文件任务抢 ForkJoinPool 而互相死锁。
-          ./gradlew --no-daemon --stacktrace :app:assembleScopedDebug
-          ./gradlew --no-daemon --stacktrace :app:assembleGlobalDebug
+          ./gradlew --no-daemon --stacktrace -Dorg.gradle.jvmargs=-Xmx4g :app:assembleScopedDebug
+          ./gradlew --no-daemon --stacktrace -Dorg.gradle.jvmargs=-Xmx4g :app:assembleGlobalDebug
 
       - name: Collect and rename APKs
         run: |

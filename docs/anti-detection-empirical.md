@@ -9,8 +9,8 @@
 
 一句话结论：**抓到的从来不是 `isFromMockProvider`，而是同一个物理量在不同通道上对不上。**
 
-> 落地状态：§1、§2、§3、§4.1、§4.2、§4.3、§4.5、§4.6、§4.7、§4.8、§4.9、§4.10、§4.11、§5、§6 已全部实现，全量编译通过，
-> `core-geo` 单元测试 78 项 + `xposed` 29 项全绿；另有 §4.4 两条已知边界未改
+> 落地状态：§1、§2、§3、§4.1、§4.2、§4.3、§4.5、§4.6、§4.7、§4.8、§4.9、§4.10、§4.11、§4.12、§5、§6 已全部实现，
+> 全量编译通过，`core-geo` 单元测试 82 项 + `xposed` 29 项全绿；另有 §4.4 两条已知边界未改
 > （基准海拔缺省值与静止位置精确，都需要产品决策）。
 > **已上机验证**（Android 15 x86_64 模拟器，LSPosed 注入目标进程、十五项改动在设备上被真实求值），
 > 过程中抓到并修掉两个只在真机暴露的 `Chain.args` 不可变问题，详见 §12；仍未走通的是「有 root 的端到端链路」。
@@ -655,6 +655,76 @@ at(k) = prevNanos + (k - prevSteps) / (curSteps - prevSteps) · (nowNs - prevNan
 * 事件时刻仍受 1 Hz 派发节拍约束：一秒内的 2~3 步是在**收到下一次派发时**才补出来的，
   时间戳正确但"到达时刻"比真实事件晚最多 1 秒。要彻底消除得改成高频派发，代价是耗电与唤醒。
 
+### 4.12 重力 / 线性加速度还停在真实值（已实施）
+
+#### 原状
+
+加速度计（`TYPE_ACCELEROMETER`）已经被改写成"重力 + 步态波形"，但两个派生通道没管：
+
+* `Sensor.TYPE_GRAVITY`（9）仍是系统融合出来的真实重力向量——指向设备真实姿态下的地心方向；
+* `Sensor.TYPE_LINEAR_ACCELERATION`（10）仍是真机读数，静止时≈0，跑起来也≈0（因为设备确实没动）。
+
+于是同一个物理量在三路之间对不上：应用把 `linear` 与 `accel` 一减，得到的残差是
+"真实的 (0, g, 0)"减去"我们的 (0, 0, g + 波形)"，是一个物理上不可能出现的方向组合；
+而 `gravity` 与 `linear` 相加本应等于 `accel`，实测却不等。
+
+#### 改法：三路同源，关系写成恒等式
+
+| 通道 | 取值 |
+|---|---|
+| `TYPE_GRAVITY` | `(0, 0, 9.80665)`，模长恒为标准重力加速度 |
+| `TYPE_ACCELEROMETER` | 重力 + 步态波形（既有实现） |
+| `TYPE_LINEAR_ACCELERATION` | `accelerometer − gravity`，**入参就是同一时刻那份加速度计快照** |
+
+`MotionRealism.Session` 新增两个方法：
+
+```kotlin
+fun gravity(): FloatArray = floatArrayOf(0f, 0f, GRAVITY)
+
+// 入参就是同一时刻的 accelerometer 结果，因此 linear[i] == accel[i] - gravity[i] 恒成立
+fun linearAcceleration(accel: FloatArray): FloatArray { ... }
+```
+
+`SensorStepHooker` 的两条改写路径（底层 `dispatchSensorEvent` 与具体监听器的 `onSensorChanged`）
+都加了这两个类型的支路，闸门与加速度计一致（`speed > 0.1`）：**静止时一律不动**——
+真机静止时的 `gravity` 与 `linear` 本来就是对的，改了只会制造新的矛盾。
+
+线性加速度用的加速度计读数由本进程缓存（`ACCEL_SNAPSHOT_TTL_MS = 200 ms`）：
+加速度计与线性加速度是两个独立事件、到达时刻不同，若各自采一次样，两次随机噪声不同，
+`linear == accel − gravity` 就不再成立。快照过期才现算。
+
+#### 顺带修掉一个隐患
+
+`accelerometer()` 原来在任何速度下都输出步态波形（振幅 `2.0 + 1.0·speed`），
+即 `speed = 0` 时仍会摆出 ±2 m/s² 的"跑步"波形。钩子层有 `speed > 0.1` 挡着，所以没暴露，
+但模型自身自相矛盾：站着不动却有加速度波形，而 `linear` ≈ 0、步数不涨。
+现在 `speed <= 0.05` 直接返回 `(0, 0, g)`。
+
+#### 实测（纯函数探针，1 分钟 @66.7 Hz，`MotionRealism` 会话）
+
+```
+GRAVITY  x=0.0000 y=0.0000 z=9.8067 |g|=9.80665
+INVARIANT max|accel-g-linear|=0.000000000 (n=4000 samples)
+LINEAR  meanZ=0.001  minZ=-7.834  maxZ=13.732
+ACCEL   meanZ=9.808
+STILL   mean|linearZ|=0.0472
+SESSIONS linearZ differing from reference (of 20) = 20
+```
+
+* 恒等式残差是**零**（不是"很小"）：同一份快照减出来的，逐位相等。
+* `ACCEL` 的均值 9.808 ≈ 重力 9.80665，说明步态波形在整段上零均值（它对 `linear` 有峰，
+  对 `accel` 只贡献均值 0 的摆幅）；`LINEAR` 的均值 0.001 同理。
+* 静态 `mean|linearZ| = 0.0472 m/s²`，量级等于 MEDIUM 档的传感器噪声（0.06），不再是"站着也有 2 m/s²"。
+
+#### 诚实边界
+
+* 模型假设**机身与行进方向对齐**（Z 竖直、Y 前后、X 左右）。真实手机是任意姿态，
+  重力会落在别的轴上——这个简化从 §4.10 的陀螺仪模型一脉相承，要修得引入姿态角（见 §4.10 的边界说明）。
+* `TYPE_MAGNETIC_FIELD`（磁力计）与 `TYPE_ROTATION_VECTOR`（旋转矢量）仍未做：
+  没有磁力计就没有可用的航向参考，硬造一个旋转矢量反而更容易被"磁场强度 / 四元数模长"交叉检验。
+* 三路同源只保证**同一时刻**自洽；应用若拿不同 dispatch 节拍上的两路相减，
+  仍然会看到噪声级差异（这在本机传感器上同样存在）。
+
 ---
 
 ## 5. 精度：原范围偏乐观（已实施：放宽基准，加慢变分量）
@@ -777,6 +847,8 @@ nextDispatchMs += dispatchPeriodMs
 | P1 | NMEA 的 GSV/GSA 原样放行，真实卫星号/几何/DOP 全泄露 | `NmeaRewrite` + `SatelliteCatalog` + `NmeaSpoofing` | GSV 里出现的 PRN 全部来自目录；三页拼起来无重复；GGA 颗数 ≤ GSV 数出来的在视野颗数 | 已实施 |
 | P1 | 陀螺仪通道完全没做，静止读数与 GPS 运动状态互相否定 | `GyroscopeModel` + `SensorStepHooker` | 转弯时 z 轴均值 = 航向变化率；直行时 ≈0；静止不是死平 | 已实施 |
 | P2 | 步事件时刻按周期等间隔回推，跨派发边界有接缝 | `StepEventTimeline` + `SensorStepHooker` | 恒定步频下相邻间隔极差 < 20 ms（原实现 357 ms） | 已实施 |
+| P1 | 重力 / 线性加速度通道仍是真机读数，与改写后的加速度计互不自洽 | `MotionRealism.Session.gravity()` / `linearAcceleration()` + `SensorStepHooker` | `linear == accel − gravity` 恒成立；静止时加速度计只剩重力、线性加速度≈0 | 已实施 |
+| P2 | 静止时加速度计仍在输出步态波形 | `MotionRealism.accelerometer()` 的静止闸门 | `speed = 0` 时三轴只剩 `(0, 0, g)` | 已实施 |
 | P2 | 基准海拔缺省 0 导致全员海平面 | `SettingsManager.kt:129` / `LocationRepository` | 不出现跨账号的同一基准值 | 未改（需产品决策，见 §4.4） |
 | P2 | 静止时位置精确等于配置坐标 | `LocationHooker` `isStationary` 分支 | 静止时仍有亚米级漂移 | 未改（见 §4.4） |
 
@@ -784,9 +856,9 @@ nextDispatchMs += dispatchPeriodMs
 
 ## 11. 本次改动的验证边界
 
-本仓库这一轮改了 17 项（§1、§2、§3、§4.1、§4.2、§4.3、§4.5 卫星数与天空几何、§4.6 气压计、
+本仓库这一轮改了 18 项（§1、§2、§3、§4.1、§4.2、§4.3、§4.5 卫星数与天空几何、§4.6 气压计、
 §4.7 MSL 海拔与垂直精度、§4.8 首个 fix 耗时、§4.9 NMEA 的 GSV/GSA、§4.10 陀螺仪、
-§4.11 步事件时刻、§5、§6、计步初值）。
+§4.11 步事件时刻、§4.12 重力与线性加速度、§5、§6、计步初值）。
 这批改动里有**一次真正的上机运行**（§12：APK 装进 Android 15 模拟器、Xposed 注入目标进程成功），
 并且做到了**坐标这一项的端到端对照**（改配置即换城市，§12.6）；
 但**没有做过带 root 的完整真机链路验证**，除坐标之外的数值也只有派发侧证据。
@@ -803,10 +875,10 @@ nextDispatchMs += dispatchPeriodMs
 - `app-ui` / `core-data` / `service` 三个模块的 Compose、高德/百度 Maps 依赖在本机拿不到，
   没有本地编译；它们的编译由仓库的 `build` 工作流在 CI 上兜（`assembleScopedDebug`）。
 
-**② 单元测试（`core-geo` 12 个测试类、78 项 + `xposed` 5 个测试类、29 项）**
+**② 单元测试（`core-geo` 12 个测试类、82 项 + `xposed` 5 个测试类、29 项）**
 
 - 同样绕开 Gradle：编译 `core-geo/src/test` + JUnit 4.13.2 + hamcrest-core 1.3，
-  用 `org.junit.runner.JUnitCore` 直接跑 → **OK (78 tests)**。
+  用 `org.junit.runner.JUnitCore` 直接跑 → **OK (82 tests)**。
 - `xposed` 侧同样方式跑 `RouteEngineTest` / `HotReloadHostTest` / `VendorRegistryTest` /
   `ColorOs16VendorTest` / `LocationAltitudeMetadataTest` → **OK (29 tests)**，其中包含两条既有断言：
   显式 `altitude_variation_m = 0` 时海拔恒为基准值（`assertEquals(80.0, …, 0.0)`），
@@ -830,6 +902,8 @@ nextDispatchMs += dispatchPeriodMs
   航向变化率、直行 z 均值≈0、幅度随速度增长、不同场次不同）。
 - §4.11 的步事件时刻有 8 项单测（首帧只对齐、穿越点插值位置、一秒内无穿越、时间倒退重对齐、
   大跳变只保留最近 8 步、超期事件丢弃、`reset`、恒定步频下 20 秒正好 54 步且相邻间隔 370 ms±3 ms）。
+- §4.12 的重力 / 线性加速度有 4 项单测：重力向量模长标准、`linear` 逐轴等于 `accel - gravity`
+  （4000 点）、整段上 `linear` 零均值而 `accel` 均值等于重力、静止时加速度计只剩 `(0, 0, g)`。
 
 **③ 自建测量用例（bearing 差分）**
 

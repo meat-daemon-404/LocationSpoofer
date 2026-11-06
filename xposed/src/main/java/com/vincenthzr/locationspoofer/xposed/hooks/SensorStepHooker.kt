@@ -68,6 +68,17 @@ object SensorStepHooker {
     private var mockStepDetectorSensor: Sensor? = null
     private var mockAccelerometerSensor: Sensor? = null
     private var mockPressureSensor: Sensor? = null
+    private var mockGravitySensor: Sensor? = null
+    private var mockLinearAccelSensor: Sensor? = null
+
+    // 线性加速度要与同一时刻的加速度计同源；跨派发节拍的旧快照不如不要
+    private const val ACCEL_SNAPSHOT_TTL_MS = 200L
+
+    @Volatile
+    private var lastAccelSnapshot: FloatArray? = null
+
+    @Volatile
+    private var lastAccelSnapshotAtMs: Long = 0L
 
     // 跟踪 handle 到 sensor type 的映射
     private val handleToTypeMap = ConcurrentHashMap<Int, Int>()
@@ -201,6 +212,19 @@ object SensorStepHooker {
                             if (gyroscopeEnabled(config) && speed > 0.1) {
                                 applySyntheticRotation(values, config, speed)
                             }
+                        } else if (
+                            (sensorType == Sensor.TYPE_GRAVITY || sensorType == Sensor.TYPE_LINEAR_ACCELERATION) &&
+                            values.size >= 3
+                        ) {
+                            // 重力 / 线性加速度是加速度计的派生通道：加速度计改了而它们不改，
+                            // 应用把两路一相减就能看出「原始读数在动、派生通道还是静止的」
+                            if (config.optBoolean("enable_step_simulation", true) && speed > 0.1) {
+                                if (sensorType == Sensor.TYPE_GRAVITY) {
+                                    applySyntheticGravity(values, config)
+                                } else {
+                                    applySyntheticLinearAcceleration(values, config, speed)
+                                }
+                            }
                         } else if (config.optBoolean("enable_step_simulation", true)) {
                             if (sensorType == Sensor.TYPE_STEP_COUNTER) {
                                 // 仅对明确判定的计步器传感器进行步数计算，严禁误判光感/距离传感器
@@ -230,7 +254,9 @@ object SensorStepHooker {
         mockStepCounterSensor, mockStepDetectorSensor, mockAccelerometerSensor,
         handleToTypeMap.map { arrayOf(it.key, it.value) }.toTypedArray(),
         // 追加到末尾而不是插在中间：热重载状态是只在本进程内传递的数组，改下标会让旧状态解析错位
-        mockPressureSensor
+        mockPressureSensor,
+        mockGravitySensor,
+        mockLinearAccelSensor
     )
 
     internal fun clearReloadState() { capturedListeners.clear(); hookedListenerClasses.clear() }
@@ -251,6 +277,8 @@ object SensorStepHooker {
             handleToTypeMap[it[0] as Int] = it[1] as Int
         }
         mockPressureSensor = state.getOrNull(8) as? Sensor
+        mockGravitySensor = state.getOrNull(9) as? Sensor
+        mockLinearAccelSensor = state.getOrNull(10) as? Sensor
     }
 
     /**
@@ -275,6 +303,20 @@ object SensorStepHooker {
                                 // 陀螺仪：静止时真实读数本来就是"没动"，不需要改；运动时必须与速度/航向自洽
                                 if (gyroscopeEnabled(config) && speed > 0.1) {
                                     applySyntheticRotation(event.values, config, speed)
+                                    event.timestamp = SystemClock.elapsedRealtimeNanos()
+                                }
+                            } else if (
+                                (event.sensor.type == Sensor.TYPE_GRAVITY ||
+                                    event.sensor.type == Sensor.TYPE_LINEAR_ACCELERATION) &&
+                                event.values.size >= 3
+                            ) {
+                                // 同上：派生通道必须与加速度计同源，且只在运动中改写
+                                if (config.optBoolean("enable_step_simulation", true) && speed > 0.1) {
+                                    if (event.sensor.type == Sensor.TYPE_GRAVITY) {
+                                        applySyntheticGravity(event.values, config)
+                                    } else {
+                                        applySyntheticLinearAcceleration(event.values, config, speed)
+                                    }
                                     event.timestamp = SystemClock.elapsedRealtimeNanos()
                                 }
                             } else if (config.optBoolean("enable_step_simulation", true)) {
@@ -302,12 +344,47 @@ object SensorStepHooker {
 
     private fun applySyntheticVibration(values: FloatArray, config: JSONObject, speed: Double) {
         val now = System.currentTimeMillis()
-        val stepsFloat = calculateCurrentStepsFloat(config, now)
-        val motionSpeed = RouteEngine.calculateCurrentPosition(config, now).speed.toDouble().takeIf { it > 0.0 } ?: speed
-        val synthetic = RouteEngine.realismSession(config).accelerometer(stepsFloat, motionSpeed, gaitTemplate(config), noiseRng)
+        val synthetic = syntheticAcceleration(config, speed, now)
         values[0] = synthetic[0]
         values[1] = synthetic[1]
         values[2] = synthetic[2]
+        // 留一份给线性加速度通道复用：两个通道各自采样一次的话，噪声不同就对不上了
+        lastAccelSnapshot = synthetic
+        lastAccelSnapshotAtMs = now
+    }
+
+    /** 生成一份加速度计读数（含重力），坐标约定 X 左右、Y 前后、Z 竖直 */
+    private fun syntheticAcceleration(config: JSONObject, speed: Double, now: Long): FloatArray {
+        val stepsFloat = calculateCurrentStepsFloat(config, now)
+        val motionSpeed = RouteEngine.calculateCurrentPosition(config, now).speed.toDouble().takeIf { it > 0.0 } ?: speed
+        return RouteEngine.realismSession(config).accelerometer(stepsFloat, motionSpeed, gaitTemplate(config), noiseRng)
+    }
+
+    /** 重力通道：竖直轴恒为 g，另两轴为 0，与 [syntheticAcceleration] 的坐标约定一致 */
+    private fun applySyntheticGravity(values: FloatArray, config: JSONObject) {
+        val gravity = RouteEngine.realismSession(config).gravity()
+        values[0] = gravity[0]
+        values[1] = gravity[1]
+        values[2] = gravity[2]
+    }
+
+    /**
+     * 线性加速度通道：加速度计减去重力。
+     * 优先复用刚生成的加速度计快照，保证应用看到的 `linear == accel - gravity` 成立；
+     * 快照太旧（超过 [ACCEL_SNAPSHOT_TTL_MS]）时按同一套参数现算一份。
+     */
+    private fun applySyntheticLinearAcceleration(values: FloatArray, config: JSONObject, speed: Double) {
+        val now = System.currentTimeMillis()
+        val snapshot = lastAccelSnapshot
+        val accel = if (snapshot != null && now - lastAccelSnapshotAtMs in 0..ACCEL_SNAPSHOT_TTL_MS) {
+            snapshot
+        } else {
+            syntheticAcceleration(config, speed, now)
+        }
+        val linear = RouteEngine.realismSession(config).linearAcceleration(accel)
+        values[0] = linear[0]
+        values[1] = linear[1]
+        values[2] = linear[2]
     }
 
     /** 气压模拟是否开启：默认开启，用户显式关掉（`barometer_simulation = false`）时完全不动这一路 */
@@ -361,6 +438,10 @@ object SensorStepHooker {
     private fun isSimulatedSensorType(type: Int): Boolean = when (type) {
         Sensor.TYPE_STEP_COUNTER, Sensor.TYPE_STEP_DETECTOR -> true
         Sensor.TYPE_PRESSURE -> barometerEnabled((XposedHelpers.module as? LocationHooker)?.readConfig())
+        Sensor.TYPE_GRAVITY, Sensor.TYPE_LINEAR_ACCELERATION -> {
+            val config = (XposedHelpers.module as? LocationHooker)?.readConfig()
+            config != null && config.optBoolean("active", false) && config.optBoolean("enable_step_simulation", true)
+        }
         else -> false
     }
 
@@ -368,6 +449,7 @@ object SensorStepHooker {
     private fun isCapturedSensorType(type: Int): Boolean = when (type) {
         Sensor.TYPE_STEP_COUNTER, Sensor.TYPE_STEP_DETECTOR, Sensor.TYPE_ACCELEROMETER -> true
         Sensor.TYPE_GYROSCOPE -> true
+        Sensor.TYPE_GRAVITY, Sensor.TYPE_LINEAR_ACCELERATION -> true
         Sensor.TYPE_PRESSURE -> mockPressureSensor != null || barometerEnabled((XposedHelpers.module as? LocationHooker)?.readConfig())
         else -> false
     }
@@ -578,6 +660,8 @@ object SensorStepHooker {
         if (type == Sensor.TYPE_STEP_DETECTOR && mockStepDetectorSensor != null) return mockStepDetectorSensor
         if (type == Sensor.TYPE_ACCELEROMETER && mockAccelerometerSensor != null) return mockAccelerometerSensor
         if (type == Sensor.TYPE_PRESSURE && mockPressureSensor != null) return mockPressureSensor
+        if (type == Sensor.TYPE_GRAVITY && mockGravitySensor != null) return mockGravitySensor
+        if (type == Sensor.TYPE_LINEAR_ACCELERATION && mockLinearAccelSensor != null) return mockLinearAccelSensor
 
         try {
             val sensorClass = Class.forName("android.hardware.Sensor", false, classLoader)
@@ -590,19 +674,40 @@ object SensorStepHooker {
                 Sensor.TYPE_STEP_COUNTER -> "Step Counter Sensor"
                 Sensor.TYPE_STEP_DETECTOR -> "Step Detector Sensor"
                 Sensor.TYPE_PRESSURE -> "Pressure Sensor"
+                Sensor.TYPE_GRAVITY -> "Gravity Sensor"
+                Sensor.TYPE_LINEAR_ACCELERATION -> "Linear Acceleration Sensor"
                 else -> "Accelerometer Sensor"
             })
             setSensorField(sensor, "mVendor", "Android")
             setSensorField(sensor, "mVersion", 1)
             // 气压计的量程/分辨率/功耗按常见型号（BMP 系列）取值，单位 hPa / mA
-            setSensorField(sensor, "mResolution", if (type == Sensor.TYPE_PRESSURE) 0.01f else 1.0f)
-            setSensorField(sensor, "mPower", if (type == Sensor.TYPE_PRESSURE) 0.007f else 0.05f)
+            // 重力 / 线性加速度是加速度计的派生量，分辨率与功耗按同一颗器件取
+            setSensorField(
+                sensor,
+                "mResolution",
+                when (type) {
+                    Sensor.TYPE_PRESSURE -> 0.01f
+                    Sensor.TYPE_GRAVITY, Sensor.TYPE_LINEAR_ACCELERATION -> 0.0012f
+                    else -> 1.0f
+                }
+            )
+            setSensorField(
+                sensor,
+                "mPower",
+                when (type) {
+                    Sensor.TYPE_PRESSURE -> 0.007f
+                    Sensor.TYPE_GRAVITY, Sensor.TYPE_LINEAR_ACCELERATION -> 0.175f
+                    else -> 0.05f
+                }
+            )
 
             when (type) {
                 Sensor.TYPE_STEP_COUNTER -> mockStepCounterSensor = sensor
                 Sensor.TYPE_STEP_DETECTOR -> mockStepDetectorSensor = sensor
                 Sensor.TYPE_ACCELEROMETER -> mockAccelerometerSensor = sensor
                 Sensor.TYPE_PRESSURE -> mockPressureSensor = sensor
+                Sensor.TYPE_GRAVITY -> mockGravitySensor = sensor
+                Sensor.TYPE_LINEAR_ACCELERATION -> mockLinearAccelSensor = sensor
             }
             return sensor
         } catch (_: Throwable) {

@@ -123,4 +123,73 @@ class MotionRealismTest {
         }
         assertTrue("span ${values.max() - values.min()}", values.max() - values.min() > 0.2)
     }
+
+    @Test
+    fun `gravity is a constant vector of standard magnitude`() {
+        val s = MotionRealism.Session(start, MotionRealism.Level.MEDIUM, 10)
+        val g = s.gravity()
+        assertEquals(0f, g[0], 0f)
+        assertEquals(0f, g[1], 0f)
+        assertEquals(9.80665f, g[2], 1e-4f)
+        assertEquals(3, g.size)
+    }
+
+    @Test
+    fun `linear acceleration is exactly the accelerometer minus gravity`() {
+        // 同一时刻的两路读数必须能相互还原，否则应用把两路一减就看出通道不自洽
+        val s = MotionRealism.Session(start, MotionRealism.Level.MEDIUM, 10)
+        val noise = Random(7)
+        val g = s.gravity()
+        var sawMotion = false
+        for (t in 0..120 step 2) {
+            val stepsFloat = s.steps(170.0, t.toDouble())
+            val accel = s.accelerometer(stepsFloat, 3.0, null, noise)
+            val linear = s.linearAcceleration(accel)
+            for (i in 0..2) {
+                assertEquals("axis $i at $t", accel[i] - g[i], linear[i], 1e-6f)
+            }
+            if (abs(linear[2]) > 0.5f) sawMotion = true
+        }
+        assertTrue("linear acceleration should show the gait waveform", sawMotion)
+    }
+
+    @Test
+    fun `linear acceleration averages to zero over a stride while gravity carries the mean`() {
+        val s = MotionRealism.Session(start, MotionRealism.Level.OFF, 0)
+        val noise = Random(11)
+        var sumZ = 0.0
+        var sumAccelZ = 0.0
+        var n = 0
+        // 采样步长必须远小于步态周期，否则会落在同一步的同一相位上、把波形混叠成常数
+        var i = 0
+        while (i < 4000) {
+            val t = i * 0.015
+            val stepsFloat = s.steps(170.0, t)
+            val accel = s.accelerometer(stepsFloat, 3.0, null, noise)
+            val linear = s.linearAcceleration(accel)
+            sumZ += linear[2]
+            sumAccelZ += accel[2]
+            n++
+            i++
+        }
+        assertTrue("mean linear z ${sumZ / n}", abs(sumZ / n) < 0.6)
+        assertTrue("mean accel z ${sumAccelZ / n}", abs(sumAccelZ / n - 9.80665) < 0.6)
+    }
+
+    @Test
+    fun `standing still leaves only gravity on the accelerometer`() {
+        // 静止时加速度计若还在摆步态波形，就与「线性加速度≈0、步数不增长」相互矛盾
+        val s = MotionRealism.Session(start, MotionRealism.Level.OFF, 0)
+        val noise = Random(3)
+        var maxDeviation = 0f
+        var i = 0
+        while (i < 200) {
+            val accel = s.accelerometer((i * 0.37), 0.0, null, noise)
+            assertEquals(0f, accel[0], 0f)
+            assertEquals(0f, accel[1], 0f)
+            maxDeviation = maxOf(maxDeviation, abs(accel[2] - 9.80665f))
+            i++
+        }
+        assertTrue("max deviation $maxDeviation", maxDeviation < 1e-3f)
+    }
 }

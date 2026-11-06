@@ -59,6 +59,7 @@ object MotionRealism {
     /** 速度变化中由步频承担的比例，其余由步幅承担（步幅 = 速度 / 步频） */
     private const val CADENCE_SHARE_OF_SPEED = 0.4
     private const val RUN_SPEED_THRESHOLD = 2.2
+private const val STILL_SPEED_MPS = 0.05
     private const val GRAVITY = 9.80665f
 
     private const val SPEED_SALT = 0x5EED5EEDL
@@ -138,15 +139,34 @@ object MotionRealism {
             val stepIndex = floor(stepsFloat).toLong()
             val stepPhase = stepsFloat - stepIndex
             val strength = 1 + level.stepAmplitudeVariation * hashUnit(startTimestamp xor STEP_SALT, stepIndex)
-            val out = if (template != null) {
-                template.sample(stepsFloat / 2.0, strength)
-            } else {
-                proceduralGait(stepPhase, stepsFloat, stepIndex, speed, strength)
+            val out = when {
+                // 站着不动时加速度计上只剩重力；不设这道闸门，静止也会摆出 ±2 m/s² 的"步态"，
+                // 与线性加速度≈0、步数不涨这几件事相互矛盾
+                speed <= STILL_SPEED_MPS -> floatArrayOf(0f, 0f, GRAVITY)
+                template != null -> template.sample(stepsFloat / 2.0, strength)
+                else -> proceduralGait(stepPhase, stepsFloat, stepIndex, speed, strength)
             }
             if (level.sensorNoise > 0) {
                 for (i in 0..2) out[i] += (noise.nextGaussian() * level.sensorNoise).toFloat()
             }
             return out
+        }
+
+        /**
+         * 重力传感器（`Sensor.TYPE_GRAVITY`）读数：重力在三轴上的分量，模长恒为 9.80665 m/s²。
+         * 坐标系与 [accelerometer] 一致（Z 竖直、Y 前后、X 左右），因此就是 (0, 0, g)。
+         * 真实实现里这是低通滤波后的重力向量，姿态变了它会跟着变；本模型假设机身与行进方向对齐。
+         */
+        fun gravity(): FloatArray = floatArrayOf(0f, 0f, GRAVITY)
+
+        /**
+         * 线性加速度（`Sensor.TYPE_LINEAR_ACCELERATION`）读数：加速度计去掉重力分量。
+         * 入参就是同一时刻的 [accelerometer] 结果，因此关系恒为 `linear[i] == accel[i] - gravity[i]`；
+         * 不要在这里重新采样一次加速度计——那样两次随机噪声不同，同一个物理量在两个通道上就对不上了。
+         */
+        fun linearAcceleration(accel: FloatArray): FloatArray {
+            val g = gravity()
+            return floatArrayOf(accel[0] - g[0], accel[1] - g[1], accel[2] - g[2])
         }
     }
 

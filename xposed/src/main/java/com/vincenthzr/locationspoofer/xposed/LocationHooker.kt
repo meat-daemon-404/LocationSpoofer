@@ -31,6 +31,7 @@ import org.json.JSONObject
 import java.io.File
 import android.os.ParcelFileDescriptor
 import com.vincenthzr.locationspoofer.utils.FrameworkConfigChannel
+import com.vincenthzr.locationspoofer.utils.GyroscopeModel
 import com.vincenthzr.locationspoofer.utils.NmeaRewrite
 import com.vincenthzr.locationspoofer.utils.SatelliteCatalog
 import com.vincenthzr.locationspoofer.utils.SatelliteModel
@@ -667,12 +668,30 @@ class LocationHooker : XposedModule() {
             val gsv = NmeaRewrite.gsvSentence(
                 "GP", 1, NmeaRewrite.gsvPageCount(gp.size), gp.size, gp.take(NmeaRewrite.GSV_PAGE_SIZE)
             )
+            // 运动学三件：加速度计、重力、线性加速度必须是同一份快照减出来的
+            val session = RouteEngine.realismSession(config)
+            val elapsedSec = if (seed > 0L) (now - seed).coerceAtLeast(0L) / 1000.0 else 0.0
+            val stepsFloat = session.steps(config.optDouble("step_cadence_spm", 165.0), elapsedSec)
+            val accel = session.accelerometer(stepsFloat, position.speed.toDouble(), null, java.util.Random(0L))
+            val gravity = session.gravity()
+            val linear = session.linearAcceleration(accel)
+            val gyro = GyroscopeModel.sample(
+                position.speed.toDouble(),
+                config.optDouble("step_cadence_spm", 165.0),
+                0.0,
+                seed,
+                elapsedSec
+            )
             val message = "[DebugConfig] pos=" + "%.6f".format(position.lat) + "," + "%.6f".format(position.lng) +
                 " speed=" + "%.2f".format(position.speed) +
                 " alt=" + "%.2f".format(RouteEngine.realisticAltitude(config, now)) +
                 " hPa=" + "%.2f".format(RouteEngine.realisticPressureHpa(config, now)) +
                 " sat=" + counts.visible + "/" + counts.inView + "/" + counts.usedInFix +
                 " ttff=" + RouteEngine.realisticTimeToFirstFixMs(config) +
+                " accel=" + "%.2f,%.2f,%.2f".format(accel[0], accel[1], accel[2]) +
+                " gravity=" + "%.2f,%.2f,%.2f".format(gravity[0], gravity[1], gravity[2]) +
+                " linear=" + "%.2f,%.2f,%.2f".format(linear[0], linear[1], linear[2]) +
+                " gyro=" + "%.3f,%.3f,%.3f".format(gyro[0], gyro[1], gyro[2]) +
                 " nmea=" + gsv.trim()
             android.util.Log.i("LocationSpoofer", message)
         }.onFailure { error ->

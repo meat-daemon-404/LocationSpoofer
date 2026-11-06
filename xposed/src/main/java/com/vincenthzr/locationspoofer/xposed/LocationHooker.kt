@@ -31,6 +31,9 @@ import org.json.JSONObject
 import java.io.File
 import android.os.ParcelFileDescriptor
 import com.vincenthzr.locationspoofer.utils.FrameworkConfigChannel
+import com.vincenthzr.locationspoofer.utils.NmeaRewrite
+import com.vincenthzr.locationspoofer.utils.SatelliteCatalog
+import com.vincenthzr.locationspoofer.utils.SatelliteModel
 import java.util.Random
 import java.util.concurrent.ConcurrentHashMap
 import kotlin.math.abs
@@ -579,6 +582,10 @@ class LocationHooker : XposedModule() {
     internal var lastOpenCellConfigLogKey: String? = null
 
     @Volatile
+    private var debugConfigActive = false
+    private val DEBUG_CONFIG_PATH = "/data/local/tmp/locationspoofer-debug-config.json"
+
+    @Volatile
     private var configReceiver: FrameworkConfigReceiver? = null
     @Volatile private var configWorker: Thread? = null
     @Volatile private var isConfigWorkerStarted = false
@@ -595,6 +602,7 @@ class LocationHooker : XposedModule() {
             onConfig = { snapshot ->
                 val config = normalizeConfig(snapshot.config)
                 lastConfig = config
+                debugConfigActive = false
                 HookStatus.configLoaded(snapshot.source, snapshot.publishedAt)
                 logOpenCellConfigLoaded(snapshot.source, config)
             },
@@ -602,6 +610,77 @@ class LocationHooker : XposedModule() {
                 XposedBridge.log("[Config] Framework receive failed: ${error.javaClass.simpleName}: ${error.message}")
             }
         ).also { it.start() }
+        startDebugConfigFallback()
+    }
+
+    /**
+     * 调试期兜底配置源：只在 DEBUG 构建里生效。
+     *
+     * 应用自身拿不到配置时（例如设备上没有可用的 root，应用无法把快照提交给框架），
+     * 可以从 [DEBUG_CONFIG_PATH] 读一份 JSON 直接把模块驱动起来，用于在真机上核对
+     * 各个模型的输出。Release 构建在第一行就 return，这条读文件路径不存在。
+     */
+    private fun startDebugConfigFallback() {
+        if (!BuildConfig.DEBUG) return
+        val file = File(DEBUG_CONFIG_PATH)
+        Thread({
+            var lastStamp = -1L
+            while (true) {
+                try {
+                    if ((lastConfig == null || debugConfigActive) && file.canRead()) {
+                        val stamp = file.lastModified()
+                        if (stamp != lastStamp) {
+                            val config = normalizeConfig(JSONObject(file.readText()))
+                            lastConfig = config
+                            debugConfigActive = true
+                            lastStamp = stamp
+                            android.util.Log.i("LocationSpoofer", "[DebugConfig] 已加载 " + DEBUG_CONFIG_PATH)
+                            logDebugModelSnapshot(config)
+                        }
+                    }
+                } catch (error: Throwable) {
+                    android.util.Log.i(
+                        "LocationSpoofer",
+                        "[DebugConfig] 读取失败: " + error.javaClass.simpleName + ": " + error.message
+                    )
+                }
+                try {
+                    Thread.sleep(2_000L)
+                } catch (interrupted: InterruptedException) {
+                    return@Thread
+                }
+            }
+        }, "LocationSpoofer-DebugConfig").apply { isDaemon = true }.start()
+    }
+
+    /** 一条日志把本轮新增的模型输出摊平，便于在真机 logcat 里逐项核对。 */
+    private fun logDebugModelSnapshot(config: JSONObject) {
+        runCatching {
+            val now = System.currentTimeMillis()
+            val position = RouteEngine.calculateCurrentPosition(config, now)
+            val counts = RouteEngine.realisticSatelliteCounts(config, now)
+            val seed = config.optLong("start_timestamp", 0L)
+            val sky = SatelliteModel.sky(
+                counts, seed, now, SatelliteCatalog.BASE_ELEVATIONS, SatelliteCatalog.BASE_AZIMUTHS
+            )
+            val gp = NmeaRewrite.ofTalker(NmeaRewrite.satellites(sky), "GP")
+            val gsv = NmeaRewrite.gsvSentence(
+                "GP", 1, NmeaRewrite.gsvPageCount(gp.size), gp.size, gp.take(NmeaRewrite.GSV_PAGE_SIZE)
+            )
+            val message = "[DebugConfig] pos=" + "%.6f".format(position.lat) + "," + "%.6f".format(position.lng) +
+                " speed=" + "%.2f".format(position.speed) +
+                " alt=" + "%.2f".format(RouteEngine.realisticAltitude(config, now)) +
+                " hPa=" + "%.2f".format(RouteEngine.realisticPressureHpa(config, now)) +
+                " sat=" + counts.visible + "/" + counts.inView + "/" + counts.usedInFix +
+                " ttff=" + RouteEngine.realisticTimeToFirstFixMs(config) +
+                " nmea=" + gsv.trim()
+            android.util.Log.i("LocationSpoofer", message)
+        }.onFailure { error ->
+            android.util.Log.i(
+                "LocationSpoofer",
+                "[DebugConfig] 快照生成失败: " + error.javaClass.simpleName + ": " + error.message
+            )
+        }
     }
 
     internal fun logOpenCellConfigLoaded(source: String, config: JSONObject) {

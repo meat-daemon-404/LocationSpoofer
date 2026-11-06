@@ -1,4 +1,4 @@
-<div align="center">
+﻿<div align="center">
 
 <h1>LocationSpoofer</h1>
 
@@ -262,6 +262,19 @@ git clone https://github.com/your-username/LocationSpoofer.git
 
 ---
 
+## 🔓 Open-Source Commitment
+
+This project is **fully open source**, and that is a checkable promise rather than a slogan:
+
+* **The code is the product**: no precompiled library is committed to this repository (the only `.jar` is the Gradle Wrapper bootstrap). Every APK on the Releases page is built by GitHub Actions from the source of the corresponding tag — see [.github/workflows/release.yml](.github/workflows/release.yml).
+* **No usage gate**: there is no account system, activation code, membership tier, or package-name review. The two features that need external data (Wi-Fi fingerprints and cell towers) query the public Wigle / OpenCellID databases, with **API tokens supplied by the user in Settings** — never proxied or resold by this project.
+* **No proprietary backend**: no self-hosted server, no telemetry, no "connect to activate".
+* **Licensed GPL-3.0**: fork it, modify it, redistribute it (commercial use included) — but redistributions must stay open under GPL-3.0 with corresponding source.
+
+Verification commands and the boundary of third-party dependencies are documented in **[docs/open-source.md](docs/open-source.md)** (Chinese).
+
+---
+
 ## ⚠️ Disclaimer
 
 This program is intended **solely for educational, academic, and developer testing purposes** (such as debugging coordinate-dependent apps).
@@ -277,3 +290,5 @@ This project is licensed under the [GNU General Public License v3.0](LICENSE).
 ```
 Copyright (C) 2026 SuseOAA
 ```
+
+This repository used to be a fork and has since gone independent: it does not track other repositories or merge external commits. History is not rewritten — every change is traceable in the commit log and under [`docs/`](docs/).

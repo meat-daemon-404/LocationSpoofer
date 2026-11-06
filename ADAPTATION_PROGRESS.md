@@ -1,4 +1,4 @@
-# 适配进度
+﻿# 适配进度
 
 本文件记录各系统 / 机型在两个模拟方案下的**实机验证**情况，是"现在到底适配到哪了"的唯一出处。
 只登记在真机上实际测过的结果，没测过的一律写"未验证"，不要凭推测填写。
@@ -20,7 +20,7 @@
 
 | 系统 | 适配器 | 状态 | 已验证的系统版本 | 备注 |
 |---|---|---|---|---|
-| 小米 HyperOS / MIUI | `HyperOsVendor` | ✅ | HyperOS 4、HyperOS 3 | HyperOS 4 为完整实测；HyperOS 3（REDMI K90 Ultra / OS3.0.308.0.WHPCNXM）实测 global 定位注入可用，其余组件未逐一复验，见 [#74](https://github.com/HuangZhuoRui/LocationSpoofer/issues/74) |
+| 小米 HyperOS / MIUI | `HyperOsVendor` | ✅ | HyperOS 4、HyperOS 3 | HyperOS 4 为完整实测；HyperOS 3（REDMI K90 Ultra / OS3.0.308.0.WHPCNXM）实测 global 定位注入可用，其余组件未逐一复验，见历史议题 #74 |
 | OPPO ColorOS / 一加 OxygenOS | `ColorOs16Vendor`（API 36）/ `ColorOsVendor` | ⚠️ | ColorOS 16 / Android 16 | PJX110 部分实测；电话与蓝牙通过，持续定位及运动应用仍待复测；OxygenOS 未验证。见 [范围与截图](docs/adaptation/coloros16.md) |
 | 三星 One UI | `OneUiVendor` | ❔ | — | 同上 |
 | vivo OriginOS、荣耀 MagicOS、魅族 Flyme 等 | 无（落到 `AospVendor`） | ❔ | — | 尚无专用适配器 |
@@ -56,7 +56,7 @@
 | 设备 | 系统版本 | 验证日期 | 备注 |
 |---|---|---|---|
 | 小米 17 Pro Max | HyperOS 4 | 2026-09 | 全局方案开发与验证机 |
-| REDMI K90 Ultra (M332BF / warsaw) | HyperOS 3 / OS3.0.308.0.WHPCNXM / Android 16 | 2026-09 | KernelSU (ksud 4.2.0) + LSPosed v2.2.0（7854），global v3.0.0-beta-2 (arm64-v8a)；实测定位注入可用（`getLastLocation` provider=fused/network），其余组件未逐一复验，见 [#74](https://github.com/HuangZhuoRui/LocationSpoofer/issues/74) |
+| REDMI K90 Ultra (M332BF / warsaw) | HyperOS 3 / OS3.0.308.0.WHPCNXM / Android 16 | 2026-09 | KernelSU (ksud 4.2.0) + LSPosed v2.2.0（7854），global v3.0.0-beta-2 (arm64-v8a)；实测定位注入可用（`getLastLocation` provider=fused/network），其余组件未逐一复验，见历史议题 #74 |
 | PJX110 | ColorOS 16 / PJX110_16.0.1.301 / Android 16 | 2026-09 | LSPosed IT 2.1.1（7846），仅限上述部分验证 |
 
 ---

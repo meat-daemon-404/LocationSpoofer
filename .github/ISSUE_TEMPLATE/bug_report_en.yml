@@ -1,4 +1,4 @@
-name: 🐛 Bug Report (English)
+﻿name: 🐛 Bug Report (English)
 description: Report an issue, crash, or unexpected behavior in LocationSpoofer
 title: "[Bug]: "
 labels: ["bug"]
@@ -6,7 +6,7 @@ body:
   - type: markdown
     attributes:
       value: |
-        Thank you for reporting an issue! Please ensure you have read the [Documentation](README_EN.md) and searched [existing issues](https://github.com/your-username/LocationSpoofer/issues) before submitting.
+        Thank you for reporting an issue! Please ensure you have read the [Documentation](README_EN.md) and searched [existing issues](https://github.com/meat-daemon-404/LocationSpoofer/issues) before submitting.
 
   - type: input
     id: app_version

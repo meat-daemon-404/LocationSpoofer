@@ -1,4 +1,4 @@
-<div align="center">
+﻿<div align="center">
 
 <h1>LocationSpoofer</h1>
 
@@ -269,6 +269,19 @@ git clone https://github.com/your-username/LocationSpoofer.git
 
 ---
 
+## 开源承诺
+
+本项目**整车开源**，而且这不是一句口号，是可以当场复核的约定：
+
+* **代码即产物**：仓库里没有任何预编译库被提交（唯一的 `.jar` 是 Gradle Wrapper 自身的引导程序）；Release 页面上的每一个 APK 都由 GitHub Actions 用对应 tag 的源码构建，见 [.github/workflows/release.yml](.github/workflows/release.yml)。
+* **无使用门槛**：没有账号体系、激活码、会员分级、包名申请审核。需要外部数据的两项功能（Wi-Fi 指纹、基站小区）使用公开数据库 Wigle / OpenCellID，**API token 由使用者在「设置」里自行填写**，项目不代管、不做二次中转。
+* **不依赖私有后端**：没有自建服务器、没有埋点上报，也不需要「先联网激活」才能使用。
+* **协议是 GPL-3.0**：可自由 fork、修改、再分发（含商用），但再分发必须同样以 GPL-3.0 开源并提供对应源码。
+
+各条承诺的复核命令与第三方依赖的边界见 **[docs/open-source.md](docs/open-source.md)**。
+
+---
+
 ## 免责声明
 
 本程序**仅供学习研究、技术交流以及个人合法合规测试（如开发者定位测试、设备兼容性调试）使用**。
@@ -284,3 +297,5 @@ git clone https://github.com/your-username/LocationSpoofer.git
 ```
 Copyright (C) 2026 SuseOAA
 ```
+
+本仓库此前是一个 fork，之后独立演进：不跟踪其他仓库、不合并外部提交。历史不改写，全部修改都能在提交历史与 [`docs/`](docs/) 目录中查到。

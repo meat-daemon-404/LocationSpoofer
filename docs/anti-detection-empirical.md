@@ -9,8 +9,9 @@
 
 一句话结论：**抓到的从来不是 `isFromMockProvider`，而是同一个物理量在不同通道上对不上。**
 
-> 落地状态：§1、§2、§3、§4.2、§4.3 已在本次改动中实现，全量编译通过、`core-geo` 单元测试 35 项全绿；
-> §4.1、§5、§6 仍是建议。验证边界见文末「本次改动的验证边界」。
+> 落地状态：§1、§2、§3、§4.1、§4.2、§4.3、§5、§6 已全部实现，全量编译通过，
+> `core-geo` 单元测试 36 项 + `xposed` 14 项全绿；另有 §4.4 两条已知边界未改（需要产品决策）。
+> 验证边界见文末「本次改动的验证边界」。
 
 ---
 
@@ -157,20 +158,41 @@ private fun bearingAlong(along: Double, forward: Boolean): Float {
 
 ## 4. 海拔与计步初值：常量是最廉价的特征
 
-### 4.1 `realism_level = OFF` 时海拔就是常量（建议，未改）
+### 4.1 海拔会退化成常量（已实施：只改漂移幅度下限，档位语义不动）
 
-`RouteEngine.kt:91` 的 `realisticAltitude()` 本身设计是对的——按 `realism_level` 叠加浮动。
-但 `MotionRealism.kt:32` 的 `OFF(0, 0.0, ...)` 里 `altitudeAmplitudeM = 0.0`，
-于是 `RouteEngine.kt:95` 直接 `return base`，`base` 是 `config.optDouble("altitude", 25.0)`。
-而 `realismSession` 的 `realism_level` 默认取 `Level.OFF.id`。
+原链条：`RouteEngine.kt:91` 的 `realisticAltitude()` 取 `drift = level.altitudeAmplitudeM`，
+`variation = config.optDouble("altitude_variation_m", drift)`，`variation <= 0` 时直接 `return base`。
+`MotionRealism.Level.OFF` 的 `altitudeAmplitudeM` 是 `0.0`，于是有两条退化路径：
 
-即：**没开真实度（默认）的所有用户，海拔恒等于配置值；没配过的所有人恒等于 25.0。**
+| 配置 | 原实现的行为 |
+|---|---|
+| 旧版配置（没有 `realism_level` / `altitude_variation_m` 键） | `drift = 0` → `variation = 0` → 直接 `return base`，**恒等于 25.0** |
+| App 默认配置（`realism_level = 0`、`altitude_variation_m = 10`） | `drift = 0` → 地形幅度 10、漂移幅度 0 → **原地模拟时海拔恒定** |
 
-常量本身不是"某个账号异常"，而是**可跨账号聚合的全局指纹**——服务端把同一版本的
-上报值按字段一聚合，一堆账号共享同一个常量，这种特征比单个账号的异常轨迹好抓得多。
+第二种容易被误读成"已经在浮动了"：`variation = 10` 看起来有 10 米余量，但地形分量只由坐标
+决定，原地模拟（摇杆不动、定点模拟）时没有时间维度。下面的实测里这种配置的 30 分钟跨度是
+`0.000 m`。
 
-建议：把"未配置"与"配置为固定值"区分开（例如用 `NaN` / 缺键表示未配置），
-未配置时走内置的连续变化模型，而不是落回一个固定默认值。
+改法（**不动真实度档位语义**）：`MotionRealism` 增加下限常量 `MIN_ALTITUDE_DRIFT_M = 2.0`
+和 `altitudeDriftM(level)`，`realisticAltitude()` 改用它取漂移幅度。用户显式把
+`altitude_variation_m` 设成 0 仍然表示"要固定海拔"，行为一字不变。
+
+实测（30 分钟 @1 Hz，相同起点与种子，只换漂移幅度）：
+
+| 场景 | 改前 span | 改后 span | 改后取值个数（0.01 m 分辨率） |
+|---|---|---|---|
+| 旧版配置（无键），原地不动 | **0.000** | 1.892 | 178 |
+| App 默认 OFF 档，原地不动 | **0.000** | 3.784 | 330 |
+| App 默认 OFF 档，1.4 m/s 移动 | 13.970 | 9.685 | 699 |
+| MEDIUM 档 / HIGH 档 | — | — | **与改前逐点完全一致** |
+| 显式 `altitude_variation_m = 0` | 0.000 | 0.000 | 恒等于基准值 |
+
+两个取舍要写清楚：
+
+* 移动场景的跨度从 13.97 m 降到 9.69 m：总变化范围仍是 10 m，漂移分走 2 m、地形剩 8 m。
+  对真实跑步而言 3.5 km 累计起伏 9.7 m 是常见量级，可以接受；如果不接受，就把
+  `altitude_variation_m` 调大。
+* 下限只解决"完全没有时间变化"，不解决"幅度是否合理"——后者由档位/配置决定。
 
 ### 4.2 ColorOS 16 派发路径绕过 `realisticAltitude()`（已修复）
 
@@ -206,29 +228,74 @@ private val bootStepsBase: Double = 2350.0 + noiseRng.nextInt(2400).toDouble()
 
 同一进程内的接续语义不变（仍是单调递增、换会话接续），只是不再有任何跨账号可对齐的固定值。
 
+### 4.4 基准海拔的缺省值是 0（未改，需要产品决策）
+
+`SettingsManager.kt:129-131` 的 `altitude` 默认字符串是 `"0.0"`，`LocationRepository` 三处
+（`:121` / `:250` / `:293`）都是 `settingsManager.altitude.toDoubleOrNull() ?: 0.0`。
+于是**没手动填过海拔的用户，基准就是海平面 0 m**，再叠加 4.1 里的漂移之后可以落到负值：
+
+| 配置 | 实测最低值（30 分钟 @1 Hz） |
+|---|---|
+| MEDIUM 档、基准 0 | −1.529 m |
+| OFF 档（改前）、基准 0 | −7.198 m |
+
+内陆城市出现负海拔本身就是可判别的特征，而且"基准海拔集体为 0"和 4.1 里的常量问题属同一类：
+可跨账号聚合。**没有改的原因**是缺省值该填什么需要产品决策（按城市取近似高程？按最近一次
+真实定位高程？还是留空表示"未知、不上报"），随便换一个常量只是把一个指纹换成另一个。
+
+顺带记一笔：静止派发时位置抖动是被关掉的（`LocationHooker` 里 `isStationary` 分支直接把
+配置坐标当输出），所以站着不动时位置是**精确等于**配置坐标的。对定位 App 来说这没问题，
+但如果目标 App 用加速度计/陀螺仪做"静止判定 + 位置应保持不变"的一致性检查，精确相等反而
+是异常的——真机静止时位置还有亚米级漂移。这一条没有改动，只是已知边界。
+
 ---
 
-## 5. 精度：现在是好的，但范围偏乐观（建议，未改）
+## 5. 精度：原范围偏乐观（已实施：放宽基准，加慢变分量）
 
-`getJitteredAccuracy()` 用 OU 式游走（`2.2 + drift`，截断到 1.5–3.5 m），且不受
-`realism_level` 影响，恒有起伏——这一点没问题。
+原 `getJitteredAccuracy()` 用 OU 式游走 `(2.2 + drift).coerceIn(1.5, 3.5)`，恒定有起伏，
+但**分布被压在一个很窄的高质量区间**。1 Hz 采样一小时的实测分布：最小值 1.50、中位 2.23、
+最大值 3.16，即 **100% 落在 1.5–3.5 m**。真实设备在城市环境上报的水平精度通常在 3–8 m
+之间起伏，遮挡、隧道、楼间会比这更差。
 
-只提一句：1.5–3.5 m 是"满格信号"档位。实测真实设备在城市环境上报的水平精度多在
-**3–8 m** 之间起伏，遮挡场景会更差。始终报 1.5–3.5 m 的账号集合，本身就是
-"永远在空旷操场中央"的分布——不是破绽，但它把可利用的分布信息压平了。
-若要更贴，可让基准随所在区域/时段做慢变，而不是恒定基准。
+改法：基准提到 4.6 m，保留原来的 OU 游走（短周期抖动），再叠一路
+`SmoothNoise(seed, 240s, 1500s)` 的慢变分量（幅度 1.4 m）——慢变分量的周期是几百秒到二十
+分钟，对应"走进楼里、走进树下"这类场景，而不是纯随机跳。截断到 3.0–9.0 m。
+
+同样的采样条件，改后分布：最小值 3.22、中位 4.64、p95 5.62、最大值 6.36，落在旧区间
+1.5–3.5 的只剩 1.6%；换一个随机种子复现同类分布（3.37 / 4.73 / 5.53 / 6.19）。
+
+另外原来在静止派发时把精度直接写成 `2.5f`——那是又一个跨账号可对齐的常量，已改成
+`getJitteredAccuracy() * 0.7f`：静止时精度更好是合理的（手机在桌上不动），但不再是个整数常量。
+
+仍未做的一件事：精度与"看到多少颗卫星/多少基站"没有任何关系。要真做得像，得让精度跟随
+模拟出来的可见卫星数一起变，现在没有这个模型。
 
 ---
 
-## 6. 派发要钉绝对时间网格（建议，未改）
+## 6. 派发要钉绝对时间网格（已实施）
 
-1 Hz 派发如果用「上一轮 + 1000 ms」自增（当前 `LocationHooker.kt:663` 的
-`Thread.sleep(1_000L)` 本质如此），采样相位会一直漂移；下游按窗口算
+1 Hz 派发如果用「上一轮时刻 + 1000 ms」自增（原 `LocationHooker.kt:663` 的
+`Thread.sleep(1_000L)` 就是这种语义），误差会一轮一轮累积：`sleep` 本身有毫秒级溢出，
+`Thread.sleep` 醒来后还要走完一轮派发逻辑，采样相位就会持续向后漂。下游按窗口算
 `speed = Δd / Δt` 时，`Δt` 在窗口边界上抖动，速度就会出现**量化台阶**（在几个离散值之间跳）。
 
-修法：每轮算 `next = ceil(now / period) * period`，然后 `postDelayed(next - now)`。
-自检方式：记录连续派发时刻，量 `minGap`/`maxGap`——同构实现上做到
-`minGap = 996 ms`、`maxGap = 1004 ms` 即认为干净。
+改法：用单调时钟（`SystemClock.elapsedRealtime()`，不受改时间和 NTP 影响）维护一个
+绝对网格 `nextDispatchMs`，每轮只睡 `nextDispatchMs - now`，睡醒后立刻 `+= periodMs`；
+如果某轮实际落后超过一个周期（系统卡顿、GC 停顿），直接重新对齐到 `now + period`，
+不做补发——补发会让下游看到一串间隔为 0 的样本，比丢一轮更假。
+
+```kotlin
+val waitMs = nextDispatchMs - SystemClock.elapsedRealtime()
+if (waitMs > 0L) Thread.sleep(waitMs)
+nextDispatchMs += dispatchPeriodMs
+```
+
+自检方式：把连续派发时刻打出来，量相邻间隔的 `minGap` / `maxGap`。在同构实现上做到
+`minGap = 996 ms`、`maxGap = 1004 ms` 就算干净（±4 ms 是 `Thread.sleep` 的固有抖动）。
+
+**验证边界**：这条改动的正确性在本机无法直接验证——Android 的派发线程跑不起来，
+`minGap/maxGap` 那组数字来自另一套独立实现的外部实测，不是本仓库跑的。本仓库能验证的只有
+「编译通过 + 逻辑审查」：网格用的是单调时钟、睡觉前重算剩余量、落后就重对齐。
 
 ---
 
@@ -291,15 +358,20 @@ private val bootStepsBase: Double = 2350.0 + noiseRng.nextInt(2400).toDouble()
 | P0 | ColorOS 16 派发路径统一走 `realisticAltitude` | `ColorOs16LocationDelivery.kt:231,243` | 两条路径同一时刻海拔一致 | 已实施 |
 | P0 | 计步初值不再用全员共享的常量 | `SensorStepHooker.kt:48` | 不同进程/账号的起始 `STEP_COUNTER` 不相等 | 已实施 |
 | P1 | 折线顶点 bearing 阶跃 | `RoutePath.kt:61` | 相邻 0.4 m 的 bearing 变化 max < 10° | 已实施 |
-| P1 | 未配置时海拔不落回固定默认值 | `RouteEngine.kt:91` | 连续 60 s、跨账号不共享同一常量 | 建议 |
-| P2 | 派发钉绝对时间网格 | `LocationHooker.kt:663` | 派发间隔抖动 < 5 ms | 建议 |
-| P2 | 精度基准随区域/时段慢变 | `getJitteredAccuracy()` | 长期分布的方差来自数据本身而非固定截断 | 建议 |
+| P1 | 未配置时海拔不落回固定默认值 | `RouteEngine.kt:91` + `MotionRealism.altitudeDriftM()` | 原地 30 分钟海拔跨度 > 1 m、跨账号不共享同一常量 | 已实施 |
+| P1 | 精度分布集中在一个窄区间 | `getJitteredAccuracy()` | 长期分布不被截断在 3.5 m 以内 | 已实施 |
+| P2 | 派发钉绝对时间网格 | `LocationHooker.kt:663` | 派发间隔抖动 < 5 ms | 已实施（仅逻辑，未上真机） |
+| P2 | 精度基准随区域/时段慢变 | `getJitteredAccuracy()` | 慢变分量周期在分钟级 | 已实施（简单版） |
+| P2 | 基准海拔缺省 0 导致全员海平面 | `SettingsManager.kt:129` / `LocationRepository` | 不出现跨账号的同一基准值 | 未改（需产品决策，见 §4.4） |
+| P2 | 静止时位置精确等于配置坐标 | `LocationHooker` `isStationary` 分支 | 静止时仍有亚米级漂移 | 未改（见 §4.4） |
 
 ---
 
 ## 11. 本次改动的验证边界
 
-已改的五项分三种验证强度，**都没有打 APK、没有上真机**：
+本仓库这一轮改了 9 项（§4.1、§4.2、§4.3、§1、§2、§3、§5、§6、计步初值），
+**都没有打 APK、没有上真机**。按验证强度分四类：
+
 
 **① 全量编译（`core-geo` + `xposed`）**
 
@@ -309,10 +381,13 @@ private val bootStepsBase: Double = 2350.0 + noiseRng.nextInt(2400).toDouble()
 - `core-geo` 用到的 `BuildConfig` 需要一份桩（真 BuildConfig 由 flavor 生成），
   桩只要 `const val GLOBAL_SCHEME: Boolean`。
 
-**② 单元测试（`core-geo` 7 个测试类、35 项）**
+**② 单元测试（`core-geo` 7 个测试类、36 项 + `xposed` 14 项）**
 
 - 同样绕开 Gradle：编译 `core-geo/src/test` + JUnit 4.13.2 + hamcrest-core 1.3，
-  用 `org.junit.runner.JUnitCore` 直接跑 → **OK (35 tests)**。
+  用 `org.junit.runner.JUnitCore` 直接跑 → **OK (36 tests)**。
+- `xposed` 侧同样方式跑 `RouteEngineTest` → **OK (10 tests)**，其中包含两条既有断言：
+  显式 `altitude_variation_m = 0` 时海拔恒为基准值（`assertEquals(80.0, …, 0.0)`），
+  以及老配置（不写该键）落在 `base ± drift` 区间内。这两条是 §4.1 改动的回归护栏。
 - 其中 `RoutePathTest` 覆盖开环折返、闭环前进、到站停留与 `GeoMath` 一致性，
   bearing 平滑改动后全部仍通过（关键：位置与朝向在直段上逐位不变）。
 
@@ -323,8 +398,20 @@ private val bootStepsBase: Double = 2350.0 + noiseRng.nextInt(2400).toDouble()
   得到 §3 的对照表（max 90.00° → 9.09°）。
 - 同一距离的坐标在改前改后完全一致，说明平滑只作用于朝向口径。
 
-**仍然不能确定的是真机运行时行为**：反射构造 `SensorEvent` 的三条 fallback 路径，
-以及不同 ROM 下 `TYPE_STEP_DETECTOR` 的实际投递节奏、ColorOS 16 适配路径的实机命中情况。
+**④ 数值对照（海拔与精度，30 分钟 @1 Hz）**
+
+- 海拔：同一份采样代码，漂移幅度分别取「档位原值」与「`altitudeDriftM(档位)`」，
+  得到 §4.1 的对照表。最关键的两个数字是 **0.000 m → 1.892 m**（旧配置原地不动）
+  与 **0.000 m → 3.784 m**（App 默认档原地不动）；同时 MEDIUM / HIGH 两档逐点完全一致，
+  显式 `altitude_variation_m = 0` 仍完全固定——说明改动只作用在"原本完全不动"的那部分。
+- 精度：同一 OU + 慢变噪声模型各跑 3600 点，得到 §5 的分布。改前 100% 落在 1.5–3.5 m，
+  改后落在该区间的只剩 1.6%。
+
+**仍然不能确定的是真机运行时行为**：反射构造 `SensorEvent` 的三条 fallback 路径、
+不同 ROM 下 `TYPE_STEP_DETECTOR` 的实际投递节奏、`Thread.sleep` 网格在真机上的实际抖动
+（§6 的 996/1004 ms 来自另一套独立实现的外部实测，不是本仓库测的）、
+以及 ColorOS 16 适配路径的实机命中情况。
+
 
 上真机后建议按下面附录逐条量，并把结果回填到本文件。
 

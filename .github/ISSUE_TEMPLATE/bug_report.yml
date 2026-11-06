@@ -1,4 +1,4 @@
-name: 🐛 缺陷报告 (Bug Report)
+﻿name: 🐛 缺陷报告 (Bug Report)
 description: 反馈 LocationSpoofer 的异常、崩溃或模拟失效等问题
 title: "[Bug]: "
 labels: ["bug"]
@@ -6,7 +6,7 @@ body:
   - type: markdown
     attributes:
       value: |
-        感谢你反馈问题！在提交前，请先阅读 [项目文档](README.md) 并搜索 [已有的 Issues](https://github.com/your-username/LocationSpoofer/issues) 确认是否已有相同反馈。
+        感谢你反馈问题！在提交前，请先阅读 [项目文档](README.md) 并搜索 [已有的 Issues](https://github.com/meat-daemon-404/LocationSpoofer/issues) 确认是否已有相同反馈。
 
   - type: input
     id: app_version

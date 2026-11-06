@@ -122,6 +122,7 @@
 ### 6. 传感器与步频模拟
 * **计步传感器联动**：Hook `SensorManager`，接管 `Sensor.TYPE_STEP_COUNTER`（总步数）和 `Sensor.TYPE_STEP_DETECTOR`（单步脉冲）。
 * **步态频率计算**：当开启路线模拟且处于步行或跑步状态时，根据移动距离与步长（默认按 `0.7m/步` 换算）自动生成平滑递增的步数事件，适配运动健康与校园跑打卡软件。
+* **双通道同源**：`TYPE_STEP_DETECTOR` 按真实步频「每步一个事件」派发，事件时间戳取该步真实跨越时刻，使「检测器步频 / 计数器增量 / 位置通道速度」三者自洽（依据见 [docs/anti-detection-empirical.md](docs/anti-detection-empirical.md)）。
 
 ### 7. 路线规划与红绿灯模拟
 * **真实路网拟合**：支持多点路径规划，调用路网搜索算法拟合实际道路轮廓，防止直线穿墙。
@@ -196,6 +197,7 @@
 全局方案直接 Hook 系统服务，不同厂商 / 系统版本的内部实现不一样，需要逐个适配：
 
 * [ADAPTATION_PROGRESS.md](ADAPTATION_PROGRESS.md)：各系统、机型在两个方案下的实机验证进度（App 内"系统适配 → 完整适配进度"显示的就是这份文件）；
+* [docs/anti-detection-empirical.md](docs/anti-detection-empirical.md)：跨通道一致性、时间基、常量指纹等反检测实测提要，含本仓库现存缺陷的定位与判据；
 * [vendor/README.md](xposed/src/main/java/com/vincenthzr/locationspoofer/xposed/hooks/vendor/README.md)：适配框架说明与**新增一个系统的完整检查清单**；
 * [xposed/ADAPTATION_GUIDE.md](xposed/ADAPTATION_GUIDE.md)：如何在真机上定位系统内部类与方法、如何根据 App 内"Hook 运行状态"页排查适配问题。
 

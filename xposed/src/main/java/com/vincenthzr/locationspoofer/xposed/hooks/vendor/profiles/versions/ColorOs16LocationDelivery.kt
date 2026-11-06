@@ -9,6 +9,7 @@ import com.vincenthzr.locationspoofer.xposed.hooks.vendor.SystemComponent
 import com.vincenthzr.locationspoofer.xposed.diagnostics.HookStatus
 import com.vincenthzr.locationspoofer.xposed.utils.XposedHelpers
 import com.vincenthzr.locationspoofer.xposed.utils.CallScope
+import com.vincenthzr.locationspoofer.xposed.utils.RouteEngine
 import com.vincenthzr.locationspoofer.xposed.utils.XposedBridge
 import com.vincenthzr.locationspoofer.xposed.utils.getJitteredAccuracy
 import io.github.libxposed.api.XposedInterface
@@ -228,7 +229,7 @@ internal class ColorOs16LocationDelivery(
         val motion = module.getCurrentSpoofedMotion("WGS-84") ?: return null
         val provider = nameField.get(owner) as String
         return (SystemHookUtils.buildFakeLocation(
-            loader, provider, motion, config.optDouble("altitude", 25.0), module.getJitteredAccuracy()
+            loader, provider, motion, RouteEngine.realisticAltitude(config), module.getJitteredAccuracy()
         ) as? Location)?.also { applySatelliteExtras(it, config) }
     }
 
@@ -240,7 +241,7 @@ internal class ColorOs16LocationDelivery(
         for (item in locations) {
             val location = item as Location
             SystemHookUtils.applyFakeLocationFields(
-                location, motion, config.optDouble("altitude", 25.0), module.getJitteredAccuracy()
+                location, motion, RouteEngine.realisticAltitude(config), module.getJitteredAccuracy()
             )
             location.removeMslAltitude()
             location.removeMslAltitudeAccuracy()

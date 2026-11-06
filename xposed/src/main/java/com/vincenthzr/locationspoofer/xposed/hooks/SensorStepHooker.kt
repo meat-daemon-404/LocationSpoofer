@@ -43,14 +43,22 @@ object SensorStepHooker {
     val capturedListeners = CopyOnWriteArrayList<CapturedSensorListener>()
     private val hookedListenerClasses = ConcurrentHashMap<Class<*>, Boolean>()
 
+    private val noiseRng = java.util.Random()
+
     // 真实计步器自开机以来单调递增：换会话 / 摇杆每次写配置导致 start_timestamp 变化时，
-    // 把已累计的步数接续为新的起点，而不是回到初始值
-    private const val INITIAL_BOOT_STEPS = 2350.0
-    @Volatile private var stepBase: Double = INITIAL_BOOT_STEPS
-    @Volatile private var lastStepsFloat: Double = INITIAL_BOOT_STEPS
+    // 把已累计的步数接续为新的起点，而不是回到初始值。
+    // 起始值带随机量：所有用户都从同一个常量起步，本身就是可跨账号聚合的指纹。
+    private val bootStepsBase: Double = 2350.0 + noiseRng.nextInt(2400).toDouble()
+    @Volatile private var stepBase: Double = bootStepsBase
+    @Volatile private var lastStepsFloat: Double = bootStepsBase
     @Volatile private var lastStepInitTime: Long = 0L
 
-    private val noiseRng = java.util.Random()
+    // STEP_DETECTOR 需要按真实步频"每步一个事件"派发，这里记录已发出的步数游标；
+    // 步数积分则锚定单调时钟，墙钟被 NTP / 用户改动时不会让步数倒退或瞬跳
+    @Volatile private var lastDetectorSteps: Long = -1L
+    @Volatile private var stepAnchorElapsedMs: Long = 0L
+    @Volatile private var stepAnchorOffsetSec: Double = 0.0
+    private const val MAX_DETECTOR_CATCHUP = 30L
     @Volatile private var cachedTemplateSource: String? = null
     @Volatile private var cachedTemplate: GaitTemplate? = null
 
@@ -291,22 +299,34 @@ object SensorStepHooker {
         if (lastStepInitTime != startTime) {
             lastStepInitTime = startTime
             stepBase = lastStepsFloat
+            // 换会话：重新对齐 detector 游标，并把墙钟换算成一次性的偏移量
+            lastDetectorSteps = -1L
+            stepAnchorElapsedMs = SystemClock.elapsedRealtime()
+            stepAnchorOffsetSec = ((now - startTime).coerceAtLeast(0L)) / 1000.0
         }
 
         val speed = config.optDouble("speed_m_s", 0.0)
         if (speed <= 0.05) return lastStepsFloat
 
-        val elapsedSec = ((now - startTime).coerceAtLeast(0L)) / 1000.0
-        val isAutoCadence = config.optBoolean("is_auto_cadence", true)
-        val baseCadence = if (isAutoCadence) {
-            calculateAutoCadence(speed)
-        } else {
-            config.optInt("step_cadence_spm", 165).coerceIn(60, 240)
-        }
+        // 真实 STEP_COUNTER 是自开机单调递增的，不会因为改时间/校时而倒退；
+        // 所以积分时基用 elapsedRealtime，墙钟只用于把 start_timestamp 折成初始偏移
+        val elapsedSec = stepAnchorOffsetSec +
+            (SystemClock.elapsedRealtime() - stepAnchorElapsedMs) / 1000.0
+        val baseCadence = currentCadence(config)
 
         val steps = stepBase + RouteEngine.realismSession(config, startTime).steps(baseCadence.toDouble(), elapsedSec)
         lastStepsFloat = steps
         return steps
+    }
+
+    /** 当前生效步频（spm）：自动步频按速度换算，手动模式取配置值 */
+    private fun currentCadence(config: JSONObject): Int {
+        val speed = config.optDouble("speed_m_s", 0.0)
+        return if (config.optBoolean("is_auto_cadence", true)) {
+            calculateAutoCadence(speed)
+        } else {
+            config.optInt("step_cadence_spm", 165).coerceIn(60, 240)
+        }
     }
 
     /**
@@ -341,6 +361,24 @@ object SensorStepHooker {
         val listeners = capturedListeners.toList()
         if (listeners.isEmpty()) return
 
+        // 本 tick 需要补发的步事件时刻。必须在监听器循环之前算好：
+        // 每个事件对应"这一步真实跨越的时刻"，与监听器数量无关（否则第二个监听器会拿到 delta=0）
+        val pendingStepTimestamps: LongArray = if (speed > 0.1) {
+            val periodNs = (60_000_000_000.0 / currentCadence(config)).toLong()
+            val nowNs = SystemClock.elapsedRealtimeNanos()
+            val previous = lastDetectorSteps
+            lastDetectorSteps = totalSteps
+            val delta = if (previous < 0L) 0L else totalSteps - previous
+            if (delta in 1..MAX_DETECTOR_CATCHUP) {
+                LongArray(delta.toInt()) { index -> nowNs - (delta - 1L - index) * periodNs }
+            } else {
+                // 首帧对齐或异常跳变：只对齐游标，不补发，避免事件风暴
+                LongArray(0)
+            }
+        } else {
+            LongArray(0)
+        }
+
         for (entry in listeners) {
             val listener = entry.listener
             val sensor = entry.sensor ?: continue
@@ -362,18 +400,19 @@ object SensorStepHooker {
                     }
                 }
                 Sensor.TYPE_STEP_DETECTOR -> {
-                    if (speed > 0.1) {
-                        val event = createSensorEvent(sensor, floatArrayOf(1.0f))
-                        if (event != null) {
-                            targetHandler.post {
-                                try {
-                                    if (listener is SensorEventListener) {
-                                        listener.onSensorChanged(event)
-                                    } else {
-                                        XposedHelpers.callMethod(listener, "onSensorChanged", event)
-                                    }
-                                } catch (_: Throwable) {}
-                            }
+                    // 真机 TYPE_STEP_DETECTOR 是每检测到一步回调一次，间隔约 60/步频 秒；
+                    // 每秒只发一个事件会让下游算出恒定的 60 spm，与同时推送的 STEP_COUNTER
+                    // （按步频积分，每秒 +2.7~3.0）差 2.7~3.0 倍。
+                    for (stepTimestampNs in pendingStepTimestamps) {
+                        val event = createSensorEvent(sensor, floatArrayOf(1.0f), stepTimestampNs) ?: continue
+                        targetHandler.post {
+                            try {
+                                if (listener is SensorEventListener) {
+                                    listener.onSensorChanged(event)
+                                } else {
+                                    XposedHelpers.callMethod(listener, "onSensorChanged", event)
+                                }
+                            } catch (_: Throwable) {}
                         }
                     }
                 }
@@ -450,7 +489,11 @@ object SensorStepHooker {
         } catch (_: Throwable) {}
     }
 
-    private fun createSensorEvent(sensor: Sensor, values: FloatArray): SensorEvent? {
+    private fun createSensorEvent(
+        sensor: Sensor,
+        values: FloatArray,
+        timestampNs: Long = SystemClock.elapsedRealtimeNanos()
+    ): SensorEvent? {
         try {
             val eventConstructor = SensorEvent::class.java.getDeclaredConstructor(Int::class.javaPrimitiveType)
             eventConstructor.isAccessible = true
@@ -463,7 +506,7 @@ object SensorStepHooker {
 
             val timestampField = SensorEvent::class.java.getDeclaredField("timestamp")
             timestampField.isAccessible = true
-            timestampField.setLong(event, SystemClock.elapsedRealtimeNanos())
+            timestampField.setLong(event, timestampNs)
 
             val accuracyField = SensorEvent::class.java.getDeclaredField("accuracy")
             accuracyField.isAccessible = true
@@ -489,7 +532,7 @@ object SensorStepHooker {
                         sf.set(event, sensor)
                         val tf = SensorEvent::class.java.getDeclaredField("timestamp")
                         tf.isAccessible = true
-                        tf.setLong(event, SystemClock.elapsedRealtimeNanos())
+                        tf.setLong(event, timestampNs)
                         val af = SensorEvent::class.java.getDeclaredField("accuracy")
                         af.isAccessible = true
                         af.setInt(event, 3)

@@ -9,8 +9,8 @@
 
 一句话结论：**抓到的从来不是 `isFromMockProvider`，而是同一个物理量在不同通道上对不上。**
 
-> 落地状态：§1、§2、§4.2、§4.3 已在本次改动中实现并全量编译通过；§3、§4.1、§5、§6 仍是建议，
-> 验证边界见文末「本次改动的验证边界」。
+> 落地状态：§1、§2、§3、§4.2、§4.3 已在本次改动中实现，全量编译通过、`core-geo` 单元测试 35 项全绿；
+> §4.1、§5、§6 仍是建议。验证边界见文末「本次改动的验证边界」。
 
 ---
 
@@ -101,24 +101,57 @@ val elapsedSec = stepAnchorOffsetSec +
 
 ---
 
-## 3. 折线顶点会制造瞬时转向尖峰（建议，未改）
+## 3. 折线顶点会制造瞬时转向尖峰（已实施）
 
 `core-geo/.../RoutePath.kt:61` 的 `positionAt()` 是**沿折线线性插值**，
 `bearing` 直接取当前段的 `GeoMath.bearing(from, to)`（`RoutePath.kt:88`）。
 
 后果：每到一个折点，bearing 发生一次**阶跃**，阶跃幅度就是这个折点的转角。
-实测（19 点折线、1.4 m/s、相邻采样 0.4 m）：bearing 逐点变化 **p99 = 36°，max = 70°**，
-而且每个顶点都恰好出现一次。真实跑者过一个 90° 弯是 1–2 s 连续转，不是一帧转完。
+真实跑者过一个 90° 弯是 1–2 s 连续转，不是一帧转完。
 
-修法：对闭合轨迹做**二次** B 样条重采样（每段 8 个采样点，19 → 152 点）。
-实测效果：环长变化 −1.4%，转角被拉成连续过程，下游任何按 bearing 序列做一致性/FFT
-分析的风控都看不到台阶。
+本机可复现（用例：矩形闭环 400 m 四角各 90°；阶梯闭环 240 m 十二个 90°；
+按 0.4 m 定距采样，量相邻采样点的 bearing 差）：
 
-两个坑：
+| 用例 | 改前 max Δbearing | 改前 >20° 的采样数 | 改后 max Δbearing | 改后 >20° 的采样数 |
+|---|---|---|---|---|
+| 矩形闭环 400 m | 90.00° | 3 | **9.09°** | **0** |
+| 阶梯闭环 240 m | 90.00°（p99 也是 90°） | 12 | **9.09°** | **0** |
 
-- 用**三次**样条会向外鼓（环长 +2%），二次不会。
-- 重采样后必须同步更新 `totalDistance` 与 `cumulative`，否则 `positionAt(distanceTraveled)`
-  的时间轴会整体漂移，速度会跟着错。
+同构实现（另一套 19 点闭环、1.4 m/s）上量到的量级一致：bearing 逐点变化 p99 36°、max 70°，
+且每个顶点都恰好出现一次。
+
+### 已实施：改方位角口径，不动几何
+
+没有选择重采样轨迹（那会改 `totalDistance`、`cumulative` 与所有下游），
+而是把 bearing 从"当前折线段的朝向"改成真机 GNSS 的口径——**一段位移的方向**：
+
+```kotlin
+private val bearingWindow: Double = (totalDistance / 8.0).coerceIn(0.0, 2.5)
+
+private fun bearingAlong(along: Double, forward: Boolean): Float {
+    val raw = if (bearingWindow > 0.05) {
+        val head = pointAt(foldTo(along - bearingWindow))
+        val tail = pointAt(foldTo(along + bearingWindow))
+        if (GeoMath.distance(head, tail) > 0.05) GeoMath.bearing(head, tail) else segmentBearingAt(along)
+    } else segmentBearingAt(along)
+    return if (forward) raw else (raw + 180.0f) % 360.0f
+}
+```
+
+要点：
+
+- **位置逐位不变**：位置仍按原来的分段线性插值算，`totalDistance`/`cumulative` 完全没动，
+  实测同一距离的坐标与改前完全一致（`pos@50m` 前后都是 `30.0000000,120.0005186`）。
+- `foldTo()` 负责把 `along ± window` 折回 `[0, totalDistance]`（闭环取模、开环镜像），
+  这样窗口跨过首尾接缝或折返点时不会越界；两端点重合时（正好在折返点）退回单段朝向。
+- 窗口上限 2.5 m，即总共约 5 m 的位移参与定向：1.4 m/s 下约 3.6 s、3 m/s 下约 1.7 s 转完一个
+  90° 弯，落在真人过弯的时间里。
+- 闭环的接缝（最后一点 → 第一点）自动被覆盖，因为 `first`/`last` 本来就是同一点。
+
+另一个可行方向是重采样轨迹（例如二次 B 样条，每段细分 8 个点），收益是连位置也不再是折线，
+代价是两个坑：三次样条会向外鼓（环长 +2%）、二次不会；以及重采样后**必须**同步更新
+`totalDistance` 与 `cumulative`，否则 `positionAt(distanceTraveled)` 的时间轴会整体漂移、
+速度跟着错。本次没有采用，是因为它对几何的改动面大于收益。
 
 ---
 
@@ -257,7 +290,7 @@ private val bootStepsBase: Double = 2350.0 + noiseRng.nextInt(2400).toDouble()
 | P0 | 步数积分改单调时钟 | `SensorStepHooker.kt:299` | 触发 NTP/改系统时间后步数不倒退 | 已实施 |
 | P0 | ColorOS 16 派发路径统一走 `realisticAltitude` | `ColorOs16LocationDelivery.kt:231,243` | 两条路径同一时刻海拔一致 | 已实施 |
 | P0 | 计步初值不再用全员共享的常量 | `SensorStepHooker.kt:48` | 不同进程/账号的起始 `STEP_COUNTER` 不相等 | 已实施 |
-| P1 | 折线顶点二次 B 样条平滑 | `RoutePath.kt:61` | 相邻 0.4 m 的 bearing 变化 p99 < 10° | 建议 |
+| P1 | 折线顶点 bearing 阶跃 | `RoutePath.kt:61` | 相邻 0.4 m 的 bearing 变化 max < 10° | 已实施 |
 | P1 | 未配置时海拔不落回固定默认值 | `RouteEngine.kt:91` | 连续 60 s、跨账号不共享同一常量 | 建议 |
 | P2 | 派发钉绝对时间网格 | `LocationHooker.kt:663` | 派发间隔抖动 < 5 ms | 建议 |
 | P2 | 精度基准随区域/时段慢变 | `getJitteredAccuracy()` | 长期分布的方差来自数据本身而非固定截断 | 建议 |
@@ -266,14 +299,32 @@ private val bootStepsBase: Double = 2350.0 + noiseRng.nextInt(2400).toDouble()
 
 ## 11. 本次改动的验证边界
 
-已改的四项**只做了编译级验证**，没有打 APK、也没有上真机：
+已改的五项分三种验证强度，**都没有打 APK、没有上真机**：
 
-- 用 `kotlin-compiler-embeddable 2.0.0` 直接以命令行编译 `core-geo` + `xposed` 两个模块的
-  全部 67 个 Kotlin 源文件（classpath = `android-34/android.jar` + libxposed API jar），
-  产出 358 个 class，**退出码 0、无错误**。
-- 因此可以确定的是：类型、符号、可见性、lambda 捕获都没有问题；
-  **不能**确定的是真机运行时行为（尤其反射构造 `SensorEvent` 的三条 fallback 路径，
-  以及不同 ROM 下 `TYPE_STEP_DETECTOR` 的实际投递节奏）。
+**① 全量编译（`core-geo` + `xposed`）**
+
+- 用 `kotlin-compiler-embeddable 2.0.0` 直接以命令行编译两个模块的全部 67 个 Kotlin 源文件
+  （classpath = `android-34/android.jar` + libxposed API jar），产出 358 个 class，
+  **退出码 0、无错误**。
+- `core-geo` 用到的 `BuildConfig` 需要一份桩（真 BuildConfig 由 flavor 生成），
+  桩只要 `const val GLOBAL_SCHEME: Boolean`。
+
+**② 单元测试（`core-geo` 7 个测试类、35 项）**
+
+- 同样绕开 Gradle：编译 `core-geo/src/test` + JUnit 4.13.2 + hamcrest-core 1.3，
+  用 `org.junit.runner.JUnitCore` 直接跑 → **OK (35 tests)**。
+- 其中 `RoutePathTest` 覆盖开环折返、闭环前进、到站停留与 `GeoMath` 一致性，
+  bearing 平滑改动后全部仍通过（关键：位置与朝向在直段上逐位不变）。
+
+**③ 自建测量用例（bearing 差分）**
+
+- 用两个合成闭环（矩形 400 m / 阶梯 240 m）按 0.4 m 定距采样，
+  同一份测量代码分别在「HEAD 版 `RoutePath`」与「改动版」的 classpath 下运行，
+  得到 §3 的对照表（max 90.00° → 9.09°）。
+- 同一距离的坐标在改前改后完全一致，说明平滑只作用于朝向口径。
+
+**仍然不能确定的是真机运行时行为**：反射构造 `SensorEvent` 的三条 fallback 路径，
+以及不同 ROM 下 `TYPE_STEP_DETECTOR` 的实际投递节奏、ColorOS 16 适配路径的实机命中情况。
 
 上真机后建议按下面附录逐条量，并把结果回填到本文件。
 

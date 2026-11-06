@@ -94,7 +94,9 @@ internal fun LocationHooker.hookLocationProviders(classLoader: ClassLoader, curr
                 // 强制启动代理注入，无论当前active是true还是false。
                 // 真正的状态校验在代理注入器的Timer中进行。
 
-                val args = chain.args
+                // 复制一份再改：Chain.getArgs() 在 Android 15 上返回不可变列表，
+                // 直接写 chain.args[i] 会抛 UnsupportedOperationException，NMEA 监听器就换不掉。
+                val args = ArrayList<Any?>(chain.args)
                 for (i in args.indices) {
                     val arg = args[i] ?: continue
 
@@ -127,7 +129,7 @@ internal fun LocationHooker.hookLocationProviders(classLoader: ClassLoader, curr
                     }
                 }
 
-                return@hookAllMethods chain.proceed(chain.args.toTypedArray())
+                return@hookAllMethods chain.proceed(args.toTypedArray())
             }
 
             // Hook 取消注册 NmeaListener

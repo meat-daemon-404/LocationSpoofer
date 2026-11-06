@@ -9,8 +9,8 @@
 
 一句话结论：**抓到的从来不是 `isFromMockProvider`，而是同一个物理量在不同通道上对不上。**
 
-> 落地状态：§1、§2、§3、§4.1、§4.2、§4.3、§4.5、§4.6、§4.7、§4.8、§4.9、§5、§6 已全部实现，全量编译通过，
-> `core-geo` 单元测试 64 项 + `xposed` 29 项全绿；另有 §4.4 两条已知边界未改
+> 落地状态：§1、§2、§3、§4.1、§4.2、§4.3、§4.5、§4.6、§4.7、§4.8、§4.9、§4.10、§4.11、§5、§6 已全部实现，全量编译通过，
+> `core-geo` 单元测试 78 项 + `xposed` 29 项全绿；另有 §4.4 两条已知边界未改
 > （基准海拔缺省值与静止位置精确，都需要产品决策）。
 > **已上机验证**（Android 15 x86_64 模拟器，LSPosed 注入目标进程、十五项改动在设备上被真实求值），
 > 过程中抓到并修掉两个只在真机暴露的 `Chain.args` 不可变问题，详见 §12；仍未走通的是「有 root 的端到端链路」。
@@ -552,6 +552,109 @@ I LocationSpoofer: [GPS_Spoofer] Detected addNmeaListener(OnNmeaMessageListener)
 * 仰角/方位来自 `SatelliteModel.sky()` 的正弦演化，与真实星历无关——只要应用不做 TLE 校验就看不出来，
   做星历校验的（极少数）能看出这不像真实轨道。
 
+### 4.10 陀螺仪通道完全没做（已实施）
+
+#### 原状
+
+位置、步数、加速度计、气压计都对得上之后，还剩一条通道是**真机读数原封不动**：
+`Sensor.TYPE_GYROSCOPE`。全仓 `xposed` + `core-geo` 搜 `TYPE_GYROSCOPE` / `yawRate` / `陀螺`
+是 **0 命中**。后果很直接：GPS 说以 3 m/s 在跑、步频 170 spm、加速度计有跑步波形，
+而角速度三轴稳定输出"设备完全静止"——这不是"某个数不对"，是两个物理量互相否定。
+
+（同一个原因下，`TYPE_MAGNETIC_FIELD` / `TYPE_ROTATION_VECTOR` 也仍是真实值；见文末边界。）
+
+#### 改法：把三轴的物理来源分清楚
+
+`GyroscopeModel.sample(speedMps, cadenceSpm, headingRateRadPerSec, seed, elapsedSec)`
+返回设备坐标系的角速度（rad/s，右手系）：
+
+| 轴 | 对应转动 | 来源 | 量级（3 m/s、168 spm） |
+|---|---|---|---|
+| x | 绕左右轴（俯仰） | `0.55 · speedFactor · 噪声 · sin(2π·步频·t)` | `mean|x| ≈ 0.10` |
+| y | 绕前后轴（横滚） | `0.34 · speedFactor · 噪声 · sin(2π·步频·t + 1.9)` | `mean|y| ≈ 0.08` |
+| z | 绕竖直轴（偏航） | `航向变化率 + 0.22 · speedFactor · 噪声 · sin(π·步频·t)` | 直行 ≈ 0，转弯 ≈ 航向变化率 |
+
+* `speedFactor = (speed / 3.0).coerceIn(0, 1.6)`：越快摆得越大，但有上限。
+* 三轴的"摆动幅度"各自乘一路 `SmoothNoise(8 s..40 s)`，避免幅度纹丝不动又成了常量。
+* z 轴的躯干反向旋转用 `π·步频`（**每两步一个周期**），而不是每步一周期——这是走/跑时躯干
+  与腿的相位差。
+* `speed <= 0.05` 时只返回本底噪声（±0.012 rad/s）：真机放在桌上时陀螺仪也不是精确的 0。
+* 逐轴截断到 ±8 rad/s，远高于人类能产生的角速度，只防越界。
+
+接线方式和气压计、加速度计一致——**改写真机实际发出的事件**，而不是自己按固定频率派发：
+
+```kotlin
+sensorType == Sensor.TYPE_GYROSCOPE && values.size >= 3 ->
+    if (gyroscopeEnabled(config) && speed > 0.1) applySyntheticRotation(values, config, speed)
+```
+
+`headingRateRadPerSec()` 用 `calculateCurrentPosition(now).bearing` 与 250 ms 前的朝向做差分，
+按 `(head - tail + 540) % 360 - 180` 折到 `(-180, 180]` 再转弧度/0.25 s —— 所以**转弯时 z 轴
+的均值天然等于路线引擎的转向速率**，两条通道不会各说各话。
+
+#### 实测（纯函数探针，30 秒~300 秒）
+
+| 场景 | 结果 |
+|---|---|
+| 静止 30 s @10 Hz | x、z 各在 `-0.011..0.010`，**300 个不同取值**（不是死平） |
+| 3.0 m/s / 168 spm / 直行 60 s | `mean\|x\|=0.102`、`mean\|y\|=0.079`、`mean(z)=-0.000` |
+| 航向变化率 0.35 rad/s（≈20°/s）转弯 300 s | `mean(z)=0.350`，偏差 **0.000** |
+| 幅度随速度（mean\|x\|） | 0.5→0.018、1.5→0.051、3.0→0.102、5.0→0.163 |
+| 20 个不同 `start_timestamp` 同一时刻 | x 轴 **20 个不同取值** |
+| 越界检查（速度 ∈{0.06,1,3,8,20} × 航向 ∈{−6,−0.5,0,0.5,6}） | 峰值最大 **6.119 rad/s**（上限 8.0） |
+
+#### 诚实边界
+
+* 波形是**正弦 + 慢调制噪声**，不是真实 IMU 数据；真做步态反演（髋/膝/踝三段摆）收益不明显。
+* 不含重力分量——重力归加速度计；`TYPE_GYROSCOPE_UNCALIBRATED` 的零偏漂移也没模拟。
+* `TYPE_MAGNETIC_FIELD` 与 `TYPE_ROTATION_VECTOR` 仍是真实值：前者牵涉地磁模型与设备朝向，
+  后者由系统融合（多数实现就是陀螺 + 加速度计），要改得先有一套姿态解算，本轮没做。
+
+---
+
+### 4.11 步事件的时刻要按步数穿越点插值（已实施）
+
+#### 原状
+
+每 1 Hz 派发时，用 `60_000_000_000.0 / 步频` 从**当前时刻往回等间隔**推出这一秒的 N 个时间戳。
+稳态下看着没问题（间隔确实等于周期），但**跨派发边界有接缝**：上一轮最后一个事件在 `now`，
+下一轮第一个事件在 `now + (1000 - 周期)`，中间空出接近一个完整周期；反过来密集时又会出现
+两个事件挤在一起。用固定步频一算就能看见这个"三拍子"。
+
+#### 改法：整数步的跨越时刻
+
+`StepEventTimeline.sample(stepsFloat, nowNs)` 记住上一次的 `(步数, 时刻)`，本次步数增加时，
+对每个跨越的整数步 `k` 按线性插值求出时刻：
+
+```
+at(k) = prevNanos + (k - prevSteps) / (curSteps - prevSteps) · (nowNs - prevNanos)
+```
+
+配套规则：最多补 8 步（防止卡顿后一次吐出上百条）；早于 2 秒的事件直接丢弃（下游缓存窗口之外
+没人要）；时间倒退时重新对齐并返回空（单调时钟被重置、或热重载恢复状态）。
+
+> 这里有个自己踩过的坑：`maxCatchUp` 是**条数上限**，下界要写成 `lastCrossing - (maxCatchUp - 1)`，
+> 写成 `- maxCatchUp` 会多出一条。单测直接抓到了，别凭直觉改。
+
+#### 实测（恒定 168 spm，60 秒、1 Hz 派发，同一个 `MotionRealism` 会话）
+
+| 实现 | 步数 | 间隔 min | 间隔 max | 极差 |
+|---|---|---|---|---|
+| 按穿越点插值（现在） | 168 | 349 ms | 364 ms | **15 ms** |
+| 每轮等间隔回推（原实现） | 168 | 285 ms | 642 ms | **357 ms** |
+
+理论间隔是 `1000 / (168/60) = 357.1 ms`。原实现前 12 个间隔是
+`357, 285, 357, 357, 285, 357, 357, 285, 357, 357, 285, 357`（ms）——那个 285/357 的交替
+就是跨秒接缝，而 642 ms 那次是接缝叠加了补发上限。
+
+#### 诚实边界
+
+* `MotionRealism.Session.steps()` 的形式是 `步频/60 · (t + 噪声积分)`，**步频一变就会重标定整段历史**。
+  本仓库的 `currentCadence()` 在同一场配置里是常量（要么固定 spm，要么由速度查表），所以真实
+  使用不会触发；但如果将来把步频做成随速度平滑变化的自适应量，必须先把 `steps()` 改成对步频积分。
+* 事件时刻仍受 1 Hz 派发节拍约束：一秒内的 2~3 步是在**收到下一次派发时**才补出来的，
+  时间戳正确但"到达时刻"比真实事件晚最多 1 秒。要彻底消除得改成高频派发，代价是耗电与唤醒。
+
 ---
 
 ## 5. 精度：原范围偏乐观（已实施：放宽基准，加慢变分量）
@@ -672,6 +775,8 @@ nextDispatchMs += dispatchPeriodMs
 | P1 | 就地改写只覆盖椭球高，MSL 海拔仍是真实值 | `LocationAltitudeMetadata` + `applyFakeLocationFields` | 同一 `Location` 上椭球高与 MSL 不出现「一真一假」；Google 融合定位路径不再漏改海拔 | 已实施 |
 | P2 | 首个 fix 耗时写死 1000 ms、两通道不一致 | `RouteEngine.realisticTimeToFirstFixMs()` | 同场次恒定、换场次变化、`onFirstFix` 与 `GpsStatus.mTimeToFirstFix` 同值 | 已实施 |
 | P1 | NMEA 的 GSV/GSA 原样放行，真实卫星号/几何/DOP 全泄露 | `NmeaRewrite` + `SatelliteCatalog` + `NmeaSpoofing` | GSV 里出现的 PRN 全部来自目录；三页拼起来无重复；GGA 颗数 ≤ GSV 数出来的在视野颗数 | 已实施 |
+| P1 | 陀螺仪通道完全没做，静止读数与 GPS 运动状态互相否定 | `GyroscopeModel` + `SensorStepHooker` | 转弯时 z 轴均值 = 航向变化率；直行时 ≈0；静止不是死平 | 已实施 |
+| P2 | 步事件时刻按周期等间隔回推，跨派发边界有接缝 | `StepEventTimeline` + `SensorStepHooker` | 恒定步频下相邻间隔极差 < 20 ms（原实现 357 ms） | 已实施 |
 | P2 | 基准海拔缺省 0 导致全员海平面 | `SettingsManager.kt:129` / `LocationRepository` | 不出现跨账号的同一基准值 | 未改（需产品决策，见 §4.4） |
 | P2 | 静止时位置精确等于配置坐标 | `LocationHooker` `isStationary` 分支 | 静止时仍有亚米级漂移 | 未改（见 §4.4） |
 
@@ -679,28 +784,29 @@ nextDispatchMs += dispatchPeriodMs
 
 ## 11. 本次改动的验证边界
 
-本仓库这一轮改了 15 项（§1、§2、§3、§4.1、§4.2、§4.3、§4.5 卫星数与天空几何、§4.6 气压计、
-§4.7 MSL 海拔与垂直精度、§4.8 首个 fix 耗时、§4.9 NMEA 的 GSV/GSA、§5、§6、计步初值）。
+本仓库这一轮改了 17 项（§1、§2、§3、§4.1、§4.2、§4.3、§4.5 卫星数与天空几何、§4.6 气压计、
+§4.7 MSL 海拔与垂直精度、§4.8 首个 fix 耗时、§4.9 NMEA 的 GSV/GSA、§4.10 陀螺仪、
+§4.11 步事件时刻、§5、§6、计步初值）。
 这批改动里有**一次真正的上机运行**（§12：APK 装进 Android 15 模拟器、Xposed 注入目标进程成功），
 并且做到了**坐标这一项的端到端对照**（改配置即换城市，§12.6）；
 但**没有做过带 root 的完整真机链路验证**，除坐标之外的数值也只有派发侧证据。
-按验证强度分九类：
+按验证强度分十类：
 
 
 **① 全量编译（`core-geo` + `xposed`）**
 
-- 用 `kotlin-compiler-embeddable 2.0.0` 直接以命令行编译两个模块的全部 73 个 Kotlin 源文件
+- 用 `kotlin-compiler-embeddable 2.0.0` 直接以命令行编译两个模块的全部 75 个 Kotlin 源文件
   加 1 份 `BuildConfig` 桩（classpath = `android-34/android.jar` + libxposed API jar），
-  产出 373 个 class，**退出码 0、无错误**。
+  产出 378 个 class，**退出码 0、无错误**。
 - `core-geo` 用到的 `BuildConfig` 需要一份桩（真 BuildConfig 由 flavor 生成），
   桩只要 `const val GLOBAL_SCHEME: Boolean`。
 - `app-ui` / `core-data` / `service` 三个模块的 Compose、高德/百度 Maps 依赖在本机拿不到，
   没有本地编译；它们的编译由仓库的 `build` 工作流在 CI 上兜（`assembleScopedDebug`）。
 
-**② 单元测试（`core-geo` 10 个测试类、64 项 + `xposed` 5 个测试类、29 项）**
+**② 单元测试（`core-geo` 12 个测试类、78 项 + `xposed` 5 个测试类、29 项）**
 
 - 同样绕开 Gradle：编译 `core-geo/src/test` + JUnit 4.13.2 + hamcrest-core 1.3，
-  用 `org.junit.runner.JUnitCore` 直接跑 → **OK (64 tests)**。
+  用 `org.junit.runner.JUnitCore` 直接跑 → **OK (78 tests)**。
 - `xposed` 侧同样方式跑 `RouteEngineTest` / `HotReloadHostTest` / `VendorRegistryTest` /
   `ColorOs16VendorTest` / `LocationAltitudeMetadataTest` → **OK (29 tests)**，其中包含两条既有断言：
   显式 `altitude_variation_m = 0` 时海拔恒为基准值（`assertEquals(80.0, …, 0.0)`），
@@ -720,6 +826,10 @@ nextDispatchMs += dispatchPeriodMs
   DOP 满足勾股关系、空槽留空、DOP 随精度单调且 VDOP>HDOP、各字段落在 NMEA 允许的整数范围、
   `missingPages` 只在真机最后一页后才补、补出来的页与前面的页拼起来不重复，
   以及「四个前缀的颗数加起来等于整份天空」这条划分性质（5 个种子 × 3 个时刻）。
+- §4.10 的陀螺仪有 6 项单测（静止只剩本底噪声且非常量、运动三轴在量程内、转弯 z 均值回到
+  航向变化率、直行 z 均值≈0、幅度随速度增长、不同场次不同）。
+- §4.11 的步事件时刻有 8 项单测（首帧只对齐、穿越点插值位置、一秒内无穿越、时间倒退重对齐、
+  大跳变只保留最近 8 步、超期事件丢弃、`reset`、恒定步频下 20 秒正好 54 步且相邻间隔 370 ms±3 ms）。
 
 **③ 自建测量用例（bearing 差分）**
 
@@ -780,7 +890,18 @@ nextDispatchMs += dispatchPeriodMs
 - 这一节证明的是「报文本身合法、内部自洽、不是真机那份」，**不证明目标应用真的会走这条通道**——
   多数应用直接用 `Location`/`GnssStatus`，只有解析 NMEA 的才看得到。
 
-**⑨ 上机（模拟器：模块注入 + DEBUG 兜底 + 派发侧日志，详见 §12）**
+**⑨ 数值对照（陀螺仪与步事件间隔，纯函数）**
+
+- 陀螺仪：静止 30 秒 @10 Hz 时 x / z 各在 `-0.011..0.010`、**300 个不同取值**（不是死平）；
+  3.0 m/s / 168 spm 直行时 `mean|x|=0.102`、`mean|y|=0.079`、`mean(z)=-0.000`；
+  航向变化率 0.35 rad/s 转弯 300 秒时 `mean(z)=0.350`（偏差 0.000）；
+  幅度随速度 0.5 / 1.5 / 3.0 / 5.0 m/s 依次为 0.018 / 0.051 / 0.102 / 0.163；
+  20 个不同场次同刻 x 有 20 个不同取值；全部越界用例峰值 6.119 rad/s（上限 8.0）。
+- 步事件时刻：恒定 168 spm、60 秒、1 Hz 派发下，新实现 168 步、相邻间隔 349–364 ms（极差 **15 ms**），
+  原实现同样 168 步但间隔 285–642 ms（极差 **357 ms**），理论值 357.1 ms。
+  原实现前 12 个间隔呈 `357, 285, 357, 357, 285, 357 …` 的三拍子，即跨派发边界的接缝。
+
+**⑩ 上机（模拟器：模块注入 + DEBUG 兜底 + 派发侧日志，详见 §12）**
 
 - debug 包（`assembleScopedDebug`，`versionName 3.0.21-beta-3`，arm64-v8a）装进 Android 15 x86_64 模拟器，
   启动正常；LSPosed 启用模块并把 `com.autonavi.minimap` 加进作用域后，目标进程日志里出现
@@ -789,7 +910,7 @@ nextDispatchMs += dispatchPeriodMs
 - 应用拿不到 root，正式配置快照发布不出来（§12.3 有完整证据），因此加了 **DEBUG 构建专用**的兜底配置源
   与一条模型摊平日志（§12.4）；这条兜底在设备上**跑通了**，日志里有：
   `pos=… speed=0.00 alt=121.44 hPa=998.84 sat=20/21/17 ttff=1127 nmea=$GPGSV,2,1,07,…*7D`，
-  20 秒后同一文件重载给出 `alt=121.66 / hPa=998.78`——**十五项改动第一次在设备上被真实求值**。
+  20 秒后同一文件重载给出 `alt=121.66 / hPa=998.78`——**这一批改动第一次在设备上被真实求值**。
 - 上机当场抓到并修掉两个 `Chain.args` 不可变问题（§12.5），修完后
   `UnsupportedOperationException` 与 `Exception in hooker` 计数**归零**，
   `[GPS_Spoofer] Detected addNmeaListener(...)` 出现两次（= §4.9 的 proxy 真的挂上了）。

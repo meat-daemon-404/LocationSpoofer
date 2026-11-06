@@ -23,6 +23,8 @@ import android.os.Handler
 import android.os.Looper
 import android.os.SystemClock
 import com.vincenthzr.locationspoofer.utils.GaitTemplate
+import com.vincenthzr.locationspoofer.utils.GyroscopeModel
+import com.vincenthzr.locationspoofer.utils.StepEventTimeline
 import com.vincenthzr.locationspoofer.xposed.LocationHooker
 import com.vincenthzr.locationspoofer.xposed.utils.RouteEngine
 import com.vincenthzr.locationspoofer.xposed.utils.XposedHelpers
@@ -53,12 +55,11 @@ object SensorStepHooker {
     @Volatile private var lastStepsFloat: Double = bootStepsBase
     @Volatile private var lastStepInitTime: Long = 0L
 
-    // STEP_DETECTOR 需要按真实步频"每步一个事件"派发，这里记录已发出的步数游标；
+    // STEP_DETECTOR 需要按真实步频"每步一个事件"派发；每个事件的时刻由连续步数的整数穿越点插值得出，
     // 步数积分则锚定单调时钟，墙钟被 NTP / 用户改动时不会让步数倒退或瞬跳
-    @Volatile private var lastDetectorSteps: Long = -1L
     @Volatile private var stepAnchorElapsedMs: Long = 0L
     @Volatile private var stepAnchorOffsetSec: Double = 0.0
-    private const val MAX_DETECTOR_CATCHUP = 30L
+    private val stepTimeline = StepEventTimeline()
     @Volatile private var cachedTemplateSource: String? = null
     @Volatile private var cachedTemplate: GaitTemplate? = null
 
@@ -195,6 +196,11 @@ object SensorStepHooker {
                             if (barometerEnabled(config)) {
                                 applySyntheticPressure(values, config)
                             }
+                        } else if (sensorType == Sensor.TYPE_GYROSCOPE && values.size >= 3) {
+                            // 陀螺仪：真实值恒为"设备静止"，与 GPS 给出的速度直接矛盾；只在运动时改写
+                            if (gyroscopeEnabled(config) && speed > 0.1) {
+                                applySyntheticRotation(values, config, speed)
+                            }
                         } else if (config.optBoolean("enable_step_simulation", true)) {
                             if (sensorType == Sensor.TYPE_STEP_COUNTER) {
                                 // 仅对明确判定的计步器传感器进行步数计算，严禁误判光感/距离传感器
@@ -265,6 +271,12 @@ object SensorStepHooker {
                                     applySyntheticPressure(event.values, config)
                                     event.timestamp = SystemClock.elapsedRealtimeNanos()
                                 }
+                            } else if (event.sensor.type == Sensor.TYPE_GYROSCOPE && event.values.size >= 3) {
+                                // 陀螺仪：静止时真实读数本来就是"没动"，不需要改；运动时必须与速度/航向自洽
+                                if (gyroscopeEnabled(config) && speed > 0.1) {
+                                    applySyntheticRotation(event.values, config, speed)
+                                    event.timestamp = SystemClock.elapsedRealtimeNanos()
+                                }
                             } else if (config.optBoolean("enable_step_simulation", true)) {
                                 if (event.sensor.type == Sensor.TYPE_STEP_COUNTER && event.values.isNotEmpty()) {
                                     val curSteps = calculateCurrentSteps(config)
@@ -302,6 +314,46 @@ object SensorStepHooker {
     private fun barometerEnabled(config: JSONObject?): Boolean =
         config != null && config.optBoolean("active", false) && config.optBoolean("barometer_simulation", true)
 
+    /** 陀螺仪模拟是否开启：默认开启，用户显式关掉（`gyroscope_simulation = false`）时完全不动这一路 */
+    private fun gyroscopeEnabled(config: JSONObject?): Boolean =
+        config != null && config.optBoolean("active", false) && config.optBoolean("gyroscope_simulation", true)
+
+    /**
+     * 由路线当前航向的变化率（rad/s）驱动陀螺仪的 z 轴。
+     *
+     * 用 250 ms 的窗口做差分：窗口太短会被折线顶点的转向阶跃放大成尖峰，太长会把正常转弯抹平。
+     */
+    private fun headingRateRadPerSec(config: JSONObject, now: Long): Double {
+        val windowMs = 250L
+        val head = RouteEngine.calculateCurrentPosition(config, now).bearing.toDouble()
+        val tail = RouteEngine.calculateCurrentPosition(config, now - windowMs).bearing.toDouble()
+        val deltaDeg = (head - tail + 540.0) % 360.0 - 180.0
+        return Math.toRadians(deltaDeg) / (windowMs / 1000.0)
+    }
+
+    /**
+     * 把真实陀螺仪事件的三轴角速度改写成"由速度、步频、航向变化率推出来的"值。
+     *
+     * 改写真实事件而不是另发：真机陀螺仪按 50~200 Hz 上报，而派发循环只有 1 Hz；
+     * 自己按高频补发既费力，又会和真实事件叠加出两条互不相干的序列。
+     */
+    private fun applySyntheticRotation(values: FloatArray, config: JSONObject, speed: Double) {
+        if (values.size < 3) return
+        val now = System.currentTimeMillis()
+        val startTime = config.optLong("start_timestamp", now)
+        val elapsedSec = (now - startTime).coerceAtLeast(0L) / 1000.0
+        val synthetic = GyroscopeModel.sample(
+            speedMps = speed,
+            cadenceSpm = currentCadence(config).toDouble(),
+            headingRateRadPerSec = headingRateRadPerSec(config, now),
+            seed = startTime,
+            elapsedSec = elapsedSec
+        )
+        values[0] = synthetic[0]
+        values[1] = synthetic[1]
+        values[2] = synthetic[2]
+    }
+
     /**
      * 需要注入虚拟实例的传感器类型。计步两类恒注入（老行为）；气压计只在开启模拟时注入，
      * 否则设备本来没有气压计时会凭空多出一个传感器，反而是新指纹。
@@ -315,6 +367,7 @@ object SensorStepHooker {
     /** 需要在 registerListener 里捕获的传感器类型（捕获后要么改写事件，要么补发事件） */
     private fun isCapturedSensorType(type: Int): Boolean = when (type) {
         Sensor.TYPE_STEP_COUNTER, Sensor.TYPE_STEP_DETECTOR, Sensor.TYPE_ACCELEROMETER -> true
+        Sensor.TYPE_GYROSCOPE -> true
         Sensor.TYPE_PRESSURE -> mockPressureSensor != null || barometerEnabled((XposedHelpers.module as? LocationHooker)?.readConfig())
         else -> false
     }
@@ -381,7 +434,7 @@ object SensorStepHooker {
             lastStepInitTime = startTime
             stepBase = lastStepsFloat
             // 换会话：重新对齐 detector 游标，并把墙钟换算成一次性的偏移量
-            lastDetectorSteps = -1L
+            stepTimeline.reset()
             stepAnchorElapsedMs = SystemClock.elapsedRealtime()
             stepAnchorOffsetSec = ((now - startTime).coerceAtLeast(0L)) / 1000.0
         }
@@ -437,7 +490,8 @@ object SensorStepHooker {
         if (speed <= 0.05) return
 
         val now = System.currentTimeMillis()
-        val totalSteps = calculateCurrentSteps(config, now)
+        val stepsFloat = calculateCurrentStepsFloat(config, now)
+        val totalSteps = stepsFloat.toLong()
 
         val listeners = capturedListeners.toList()
         if (listeners.isEmpty()) return
@@ -445,17 +499,7 @@ object SensorStepHooker {
         // 本 tick 需要补发的步事件时刻。必须在监听器循环之前算好：
         // 每个事件对应"这一步真实跨越的时刻"，与监听器数量无关（否则第二个监听器会拿到 delta=0）
         val pendingStepTimestamps: LongArray = if (speed > 0.1) {
-            val periodNs = (60_000_000_000.0 / currentCadence(config)).toLong()
-            val nowNs = SystemClock.elapsedRealtimeNanos()
-            val previous = lastDetectorSteps
-            lastDetectorSteps = totalSteps
-            val delta = if (previous < 0L) 0L else totalSteps - previous
-            if (delta in 1..MAX_DETECTOR_CATCHUP) {
-                LongArray(delta.toInt()) { index -> nowNs - (delta - 1L - index) * periodNs }
-            } else {
-                // 首帧对齐或异常跳变：只对齐游标，不补发，避免事件风暴
-                LongArray(0)
-            }
+            stepTimeline.sample(stepsFloat, SystemClock.elapsedRealtimeNanos())
         } else {
             LongArray(0)
         }

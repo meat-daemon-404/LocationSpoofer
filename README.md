@@ -128,6 +128,7 @@
 * **气压计联动**：Hook `Sensor.TYPE_PRESSURE`，按国际标准大气把当前模拟海拔换算成气压（与 `SensorManager.getAltitude()` 同一组常数），叠极小慢波动并量化到 `0.01 hPa`；设备本身没有气压计时可注入虚拟传感器。静止时独立按 1 Hz 派发，不会因为"没在走路"而断流。
 * **陀螺仪联动**：Hook `Sensor.TYPE_GYROSCOPE`，把「走路/跑步时的三轴角速度」按物理来源拆开——绕左右轴与前后轴以步频为周期摆动（幅度随速度增长），绕竖直轴的均值等于路线引擎的转向速率（直行时回到 0）。静止时只剩本底噪声，不再出现「GPS 说在跑、陀螺仪说设备完全不动」这种互相否定（依据见 [docs/anti-detection-empirical.md](docs/anti-detection-empirical.md)）。
 * **步事件时刻插值**：每步的时间戳不再是「按步频从当前时刻往回等间隔推」，而是按累计步数穿越整数的时刻线性插值得到，跨派发边界的间隔不再出现接缝（恒定步频下间隔极差从 357 ms 降到 15 ms）。
+* **磁力计与旋转矢量联动**：Hook `Sensor.TYPE_MAGNETIC_FIELD`、`TYPE_ROTATION_VECTOR`、`TYPE_GAME_ROTATION_VECTOR` 与 `TYPE_GEOMAGNETIC_ROTATION_VECTOR`。假设手机平放、机头朝行进方向：旋转矢量就是那个姿态的四元数，应用用它反解出的重力与重力通道逐位相同、反解出的磁场与磁力计通道相同；磁力计按偶极模型（`F = 34·√(1+3sin²λ)`、`tan I = 2 tan λ`）随纬度取值，水平分量顺着机头、竖直分量朝下，总量不随航向变。反解航向的误差在 1e-5 度量级，故「用磁力计算方位角」的应用拿到的是路线航向。
 * **重力与线性加速度联动**：Hook `Sensor.TYPE_GRAVITY` 与 `Sensor.TYPE_LINEAR_ACCELERATION`。重力恒为标准重力向量，线性加速度由同一时刻的加速度计读数减去重力得到，因此应用侧恒有 `linear == accelerometer − gravity`；三路若各改各的，「把两路一减得到物理上不可能的方向」就是最直接的破绽。静止时三路都不改写（真机静止时本来就是对的），模型自身也不再在 `speed = 0` 时输出步态波形。
 
 ### 7. 路线规划与红绿灯模拟

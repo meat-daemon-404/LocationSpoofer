@@ -23,6 +23,8 @@ import android.os.Handler
 import android.os.Looper
 import android.os.SystemClock
 import com.vincenthzr.locationspoofer.utils.GaitTemplate
+import com.vincenthzr.locationspoofer.utils.AttitudeModel
+import com.vincenthzr.locationspoofer.utils.GeomagneticModel
 import com.vincenthzr.locationspoofer.utils.GyroscopeModel
 import com.vincenthzr.locationspoofer.utils.StepEventTimeline
 import com.vincenthzr.locationspoofer.xposed.LocationHooker
@@ -70,6 +72,9 @@ object SensorStepHooker {
     private var mockPressureSensor: Sensor? = null
     private var mockGravitySensor: Sensor? = null
     private var mockLinearAccelSensor: Sensor? = null
+    private var mockMagneticSensor: Sensor? = null
+    private var mockRotationVectorSensor: Sensor? = null
+    private var mockGameRotationSensor: Sensor? = null
 
     // 线性加速度要与同一时刻的加速度计同源；跨派发节拍的旧快照不如不要
     private const val ACCEL_SNAPSHOT_TTL_MS = 200L
@@ -225,6 +230,15 @@ object SensorStepHooker {
                                     applySyntheticLinearAcceleration(values, config, speed)
                                 }
                             }
+                        } else if (isMagneticSensorType(sensorType) && values.size >= 3) {
+                            // 磁力计与旋转矢量：真机读的是设备真实姿态，与"机头朝行进方向"矛盾
+                            if (magneticSimulationEnabled(config) && speed > 0.1) {
+                                if (sensorType == Sensor.TYPE_MAGNETIC_FIELD) {
+                                    applySyntheticMagneticField(values, config)
+                                } else {
+                                    applySyntheticRotationVector(values, config)
+                                }
+                            }
                         } else if (config.optBoolean("enable_step_simulation", true)) {
                             if (sensorType == Sensor.TYPE_STEP_COUNTER) {
                                 // 仅对明确判定的计步器传感器进行步数计算，严禁误判光感/距离传感器
@@ -256,7 +270,10 @@ object SensorStepHooker {
         // 追加到末尾而不是插在中间：热重载状态是只在本进程内传递的数组，改下标会让旧状态解析错位
         mockPressureSensor,
         mockGravitySensor,
-        mockLinearAccelSensor
+        mockLinearAccelSensor,
+        mockMagneticSensor,
+        mockRotationVectorSensor,
+        mockGameRotationSensor
     )
 
     internal fun clearReloadState() { capturedListeners.clear(); hookedListenerClasses.clear() }
@@ -279,6 +296,9 @@ object SensorStepHooker {
         mockPressureSensor = state.getOrNull(8) as? Sensor
         mockGravitySensor = state.getOrNull(9) as? Sensor
         mockLinearAccelSensor = state.getOrNull(10) as? Sensor
+        mockMagneticSensor = state.getOrNull(11) as? Sensor
+        mockRotationVectorSensor = state.getOrNull(12) as? Sensor
+        mockGameRotationSensor = state.getOrNull(13) as? Sensor
     }
 
     /**
@@ -316,6 +336,16 @@ object SensorStepHooker {
                                         applySyntheticGravity(event.values, config)
                                     } else {
                                         applySyntheticLinearAcceleration(event.values, config, speed)
+                                    }
+                                    event.timestamp = SystemClock.elapsedRealtimeNanos()
+                                }
+                            } else if (isMagneticSensorType(event.sensor.type) && event.values.size >= 3) {
+                                // 同上：姿态类通道只在运动中改写，静止时真机读数本来就是对的
+                                if (magneticSimulationEnabled(config) && speed > 0.1) {
+                                    if (event.sensor.type == Sensor.TYPE_MAGNETIC_FIELD) {
+                                        applySyntheticMagneticField(event.values, config)
+                                    } else {
+                                        applySyntheticRotationVector(event.values, config)
                                     }
                                     event.timestamp = SystemClock.elapsedRealtimeNanos()
                                 }
@@ -387,6 +417,55 @@ object SensorStepHooker {
         values[2] = linear[2]
     }
 
+    /** 磁力计 / 旋转矢量这一组姿态通道的开关：默认开启，`magnetic_simulation = false` 时完全不动 */
+    private fun magneticSimulationEnabled(config: JSONObject?): Boolean =
+        config != null && config.optBoolean("active", false) && config.optBoolean("magnetic_simulation", true)
+
+    /** 磁力计与两种旋转矢量（含地磁的、不含地磁的）共用一套姿态模型 */
+    private fun isMagneticSensorType(type: Int?): Boolean = when (type) {
+        Sensor.TYPE_MAGNETIC_FIELD,
+        Sensor.TYPE_ROTATION_VECTOR,
+        Sensor.TYPE_GAME_ROTATION_VECTOR,
+        Sensor.TYPE_GEOMAGNETIC_ROTATION_VECTOR -> true
+        else -> false
+    }
+
+    /**
+     * 磁力计：由当前纬度与航向推出来（偶极模型），水平分量顺着机头、竖直分量朝下。
+     *
+     * 真机在没有罗盘干扰时就是这样：应用把磁力计与 GPS 航向一对比，能看出"在跑却朝着固定方向"。
+     */
+    private fun applySyntheticMagneticField(values: FloatArray, config: JSONObject) {
+        val now = System.currentTimeMillis()
+        val position = RouteEngine.calculateCurrentPosition(config, now)
+        val startTime = config.optLong("start_timestamp", now)
+        val elapsedSec = (now - startTime).coerceAtLeast(0L) / 1000.0
+        val field = GeomagneticModel.sample(
+            latitudeDeg = position.lat,
+            headingDeg = position.bearing.toDouble(),
+            seed = startTime,
+            elapsedSec = elapsedSec
+        )
+        values[0] = field[0]
+        values[1] = field[1]
+        values[2] = field[2]
+    }
+
+    /**
+     * 旋转矢量：假设平放、机头朝行进方向，把那个姿态写成四元数。
+     *
+     * 老 API 上旋转矢量可能只有 3 个值（第四个 w 由应用自己按单位长度反解），所以按长度分别写。
+     */
+    private fun applySyntheticRotationVector(values: FloatArray, config: JSONObject) {
+        val now = System.currentTimeMillis()
+        val heading = RouteEngine.calculateCurrentPosition(config, now).bearing.toDouble()
+        val q = AttitudeModel.rotationVector(heading)
+        values[0] = q[0]
+        values[1] = q[1]
+        values[2] = q[2]
+        if (values.size >= 4) values[3] = q[3]
+    }
+
     /** 气压模拟是否开启：默认开启，用户显式关掉（`barometer_simulation = false`）时完全不动这一路 */
     private fun barometerEnabled(config: JSONObject?): Boolean =
         config != null && config.optBoolean("active", false) && config.optBoolean("barometer_simulation", true)
@@ -442,6 +521,9 @@ object SensorStepHooker {
             val config = (XposedHelpers.module as? LocationHooker)?.readConfig()
             config != null && config.optBoolean("active", false) && config.optBoolean("enable_step_simulation", true)
         }
+        Sensor.TYPE_MAGNETIC_FIELD, Sensor.TYPE_ROTATION_VECTOR,
+        Sensor.TYPE_GAME_ROTATION_VECTOR, Sensor.TYPE_GEOMAGNETIC_ROTATION_VECTOR ->
+            magneticSimulationEnabled((XposedHelpers.module as? LocationHooker)?.readConfig())
         else -> false
     }
 
@@ -450,6 +532,8 @@ object SensorStepHooker {
         Sensor.TYPE_STEP_COUNTER, Sensor.TYPE_STEP_DETECTOR, Sensor.TYPE_ACCELEROMETER -> true
         Sensor.TYPE_GYROSCOPE -> true
         Sensor.TYPE_GRAVITY, Sensor.TYPE_LINEAR_ACCELERATION -> true
+        Sensor.TYPE_MAGNETIC_FIELD, Sensor.TYPE_ROTATION_VECTOR,
+        Sensor.TYPE_GAME_ROTATION_VECTOR, Sensor.TYPE_GEOMAGNETIC_ROTATION_VECTOR -> true
         Sensor.TYPE_PRESSURE -> mockPressureSensor != null || barometerEnabled((XposedHelpers.module as? LocationHooker)?.readConfig())
         else -> false
     }
@@ -662,6 +746,10 @@ object SensorStepHooker {
         if (type == Sensor.TYPE_PRESSURE && mockPressureSensor != null) return mockPressureSensor
         if (type == Sensor.TYPE_GRAVITY && mockGravitySensor != null) return mockGravitySensor
         if (type == Sensor.TYPE_LINEAR_ACCELERATION && mockLinearAccelSensor != null) return mockLinearAccelSensor
+        if (type == Sensor.TYPE_MAGNETIC_FIELD && mockMagneticSensor != null) return mockMagneticSensor
+        if (type == Sensor.TYPE_ROTATION_VECTOR && mockRotationVectorSensor != null) return mockRotationVectorSensor
+        if (type == Sensor.TYPE_GAME_ROTATION_VECTOR && mockGameRotationSensor != null) return mockGameRotationSensor
+        if (type == Sensor.TYPE_GEOMAGNETIC_ROTATION_VECTOR && mockRotationVectorSensor != null) return mockRotationVectorSensor
 
         try {
             val sensorClass = Class.forName("android.hardware.Sensor", false, classLoader)
@@ -676,6 +764,10 @@ object SensorStepHooker {
                 Sensor.TYPE_PRESSURE -> "Pressure Sensor"
                 Sensor.TYPE_GRAVITY -> "Gravity Sensor"
                 Sensor.TYPE_LINEAR_ACCELERATION -> "Linear Acceleration Sensor"
+                Sensor.TYPE_MAGNETIC_FIELD -> "Magnetometer Sensor"
+                Sensor.TYPE_ROTATION_VECTOR -> "Rotation Vector Sensor"
+                Sensor.TYPE_GAME_ROTATION_VECTOR -> "Game Rotation Vector Sensor"
+                Sensor.TYPE_GEOMAGNETIC_ROTATION_VECTOR -> "Geomagnetic Rotation Vector Sensor"
                 else -> "Accelerometer Sensor"
             })
             setSensorField(sensor, "mVendor", "Android")
@@ -688,6 +780,10 @@ object SensorStepHooker {
                 when (type) {
                     Sensor.TYPE_PRESSURE -> 0.01f
                     Sensor.TYPE_GRAVITY, Sensor.TYPE_LINEAR_ACCELERATION -> 0.0012f
+                    // 磁力计常见分辨率约 0.15 µT；旋转矢量是单位四元数，分辨率按 1e-5 取
+                    Sensor.TYPE_MAGNETIC_FIELD -> 0.15f
+                    Sensor.TYPE_ROTATION_VECTOR, Sensor.TYPE_GAME_ROTATION_VECTOR,
+                    Sensor.TYPE_GEOMAGNETIC_ROTATION_VECTOR -> 0.00001f
                     else -> 1.0f
                 }
             )
@@ -697,6 +793,9 @@ object SensorStepHooker {
                 when (type) {
                     Sensor.TYPE_PRESSURE -> 0.007f
                     Sensor.TYPE_GRAVITY, Sensor.TYPE_LINEAR_ACCELERATION -> 0.175f
+                    Sensor.TYPE_MAGNETIC_FIELD -> 0.28f
+                    Sensor.TYPE_ROTATION_VECTOR, Sensor.TYPE_GAME_ROTATION_VECTOR,
+                    Sensor.TYPE_GEOMAGNETIC_ROTATION_VECTOR -> 0.175f
                     else -> 0.05f
                 }
             )
@@ -708,6 +807,10 @@ object SensorStepHooker {
                 Sensor.TYPE_PRESSURE -> mockPressureSensor = sensor
                 Sensor.TYPE_GRAVITY -> mockGravitySensor = sensor
                 Sensor.TYPE_LINEAR_ACCELERATION -> mockLinearAccelSensor = sensor
+                Sensor.TYPE_MAGNETIC_FIELD -> mockMagneticSensor = sensor
+                Sensor.TYPE_ROTATION_VECTOR -> mockRotationVectorSensor = sensor
+                Sensor.TYPE_GAME_ROTATION_VECTOR -> mockGameRotationSensor = sensor
+                Sensor.TYPE_GEOMAGNETIC_ROTATION_VECTOR -> mockRotationVectorSensor = sensor
             }
             return sensor
         } catch (_: Throwable) {

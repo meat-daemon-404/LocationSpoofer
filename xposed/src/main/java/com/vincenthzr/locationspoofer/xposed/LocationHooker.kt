@@ -31,6 +31,8 @@ import org.json.JSONObject
 import java.io.File
 import android.os.ParcelFileDescriptor
 import com.vincenthzr.locationspoofer.utils.FrameworkConfigChannel
+import com.vincenthzr.locationspoofer.utils.AttitudeModel
+import com.vincenthzr.locationspoofer.utils.GeomagneticModel
 import com.vincenthzr.locationspoofer.utils.GyroscopeModel
 import com.vincenthzr.locationspoofer.utils.NmeaRewrite
 import com.vincenthzr.locationspoofer.utils.SatelliteCatalog
@@ -682,6 +684,9 @@ class LocationHooker : XposedModule() {
                 seed,
                 elapsedSec
             )
+            // 姿态两件：磁力计与旋转矢量必须与重力/航向说同一件事
+            val mag = GeomagneticModel.sample(position.lat, position.bearing.toDouble(), seed, elapsedSec)
+            val rotationVector = AttitudeModel.rotationVector(position.bearing.toDouble())
             val message = "[DebugConfig] pos=" + "%.6f".format(position.lat) + "," + "%.6f".format(position.lng) +
                 " speed=" + "%.2f".format(position.speed) +
                 " alt=" + "%.2f".format(RouteEngine.realisticAltitude(config, now)) +
@@ -692,6 +697,10 @@ class LocationHooker : XposedModule() {
                 " gravity=" + "%.2f,%.2f,%.2f".format(gravity[0], gravity[1], gravity[2]) +
                 " linear=" + "%.2f,%.2f,%.2f".format(linear[0], linear[1], linear[2]) +
                 " gyro=" + "%.3f,%.3f,%.3f".format(gyro[0], gyro[1], gyro[2]) +
+                " mag=" + "%.2f,%.2f,%.2f".format(mag[0], mag[1], mag[2]) +
+                " rotv=" + "%.4f,%.4f,%.4f,%.4f".format(
+                    rotationVector[0], rotationVector[1], rotationVector[2], rotationVector[3]
+                ) +
                 " nmea=" + gsv.trim()
             android.util.Log.i("LocationSpoofer", message)
         }.onFailure { error ->

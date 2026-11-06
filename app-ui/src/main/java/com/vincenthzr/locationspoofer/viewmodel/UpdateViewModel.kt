@@ -1,4 +1,4 @@
-package com.vincenthzr.locationspoofer.viewmodel
+﻿package com.vincenthzr.locationspoofer.viewmodel
 
 import android.app.DownloadManager
 import android.content.Context
@@ -7,6 +7,7 @@ import androidx.lifecycle.viewModelScope
 import com.vincenthzr.locationspoofer.data.model.GithubRelease
 import com.vincenthzr.locationspoofer.ui.BuildConfig
 import com.vincenthzr.locationspoofer.utils.UpdateManager
+import com.vincenthzr.locationspoofer.utils.ProjectLinks
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -41,7 +42,7 @@ class UpdateViewModel(private val context: Context) : ViewModel() {
         viewModelScope.launch(Dispatchers.IO) {
             try {
                 val request = Request.Builder()
-                    .url("https://api.github.com/repos/HuangZhuoRui/LocationSpoofer/releases")
+                    .url(ProjectLinks.RELEASES_API_URL)
                     .header("Accept", "application/vnd.github.v3+json")
                     .build()
 

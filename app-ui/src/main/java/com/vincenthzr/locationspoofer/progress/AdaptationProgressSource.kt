@@ -1,4 +1,4 @@
-package com.vincenthzr.locationspoofer.progress
+﻿package com.vincenthzr.locationspoofer.progress
 
 import android.content.Context
 import java.io.File
@@ -7,6 +7,7 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import okhttp3.OkHttpClient
 import okhttp3.Request
+import com.vincenthzr.locationspoofer.utils.ProjectLinks
 
 /**
  * 适配进度文档的来源：优先联网取仓库 main 分支的最新版（改了文档不用发版用户就能看到），
@@ -50,8 +51,8 @@ class AdaptationProgressSource(context: Context) {
     private companion object {
         const val FILE_NAME = "ADAPTATION_PROGRESS.md"
         val REMOTE_URLS = listOf(
-            "https://raw.githubusercontent.com/HuangZhuoRui/LocationSpoofer/main/$FILE_NAME",
-            "https://cdn.jsdelivr.net/gh/HuangZhuoRui/LocationSpoofer@main/$FILE_NAME"
+            ProjectLinks.rawUrl("main", FILE_NAME),
+            ProjectLinks.jsDelivrUrl("main", FILE_NAME)
         )
         val client: OkHttpClient = OkHttpClient.Builder()
             .connectTimeout(8, TimeUnit.SECONDS)

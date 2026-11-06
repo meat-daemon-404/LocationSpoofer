@@ -1,4 +1,6 @@
-package com.vincenthzr.locationspoofer.ui.screen
+﻿package com.vincenthzr.locationspoofer.ui.screen
+
+import com.vincenthzr.locationspoofer.utils.ProjectLinks
 
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.*
@@ -343,7 +345,7 @@ fun FooterLinks(isDark: Boolean) {
             modifier = Modifier
                 .clip(RoundedCornerShape(22.dp))
                 .background(if (isDark) Color(0xFF24292E) else Color(0xFF24292E))
-                .noRippleClickable { uriHandler.openUri("https://github.com/HuangZhuoRui/LocationSpoofer") }
+                .noRippleClickable { uriHandler.openUri(ProjectLinks.REPO_URL) }
                 .padding(horizontal = 16.dp, vertical = 9.dp)
         ) {
             Row(verticalAlignment = Alignment.CenterVertically) {

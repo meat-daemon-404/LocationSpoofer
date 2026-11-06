@@ -662,8 +662,10 @@ nextDispatchMs += dispatchPeriodMs
 ## 11. 本次改动的验证边界
 
 本仓库这一轮改了 15 项（§1、§2、§3、§4.1、§4.2、§4.3、§4.5 卫星数与天空几何、§4.6 气压计、
-§4.7 MSL 海拔与垂直精度、§4.8 首个 fix 耗时、§4.9 NMEA 的 GSV/GSA、§5、§6、计步初值），
-**都没有打 APK、没有上真机**。按验证强度分八类：
+§4.7 MSL 海拔与垂直精度、§4.8 首个 fix 耗时、§4.9 NMEA 的 GSV/GSA、§5、§6、计步初值）。
+这批改动里有**一次真正的上机运行**（§12：APK 装进 Android 15 模拟器、Xposed 注入目标进程成功），
+但**没有做过带 root 的完整真机链路验证**，也**没有一条"目标应用真的读到我们的数值"的端到端证据**。
+按验证强度分九类：
 
 
 **① 全量编译（`core-geo` + `xposed`）**
@@ -759,15 +761,93 @@ nextDispatchMs += dispatchPeriodMs
 - 这一节证明的是「报文本身合法、内部自洽、不是真机那份」，**不证明目标应用真的会走这条通道**——
   多数应用直接用 `Location`/`GnssStatus`，只有解析 NMEA 的才看得到。
 
+**⑨ 上机（模拟器：模块注入与配置通道，详见 §12）**
+
+- debug 包（`assembleScopedDebug`，`versionName 3.0.21-beta-3`，arm64-v8a）装进 Android 15 x86_64 模拟器，
+  启动正常；LSPosed 启用模块并把 `com.autonavi.minimap` 加进作用域后，目标进程日志里出现
+  `[INJECTED] Hooking package`、`Anti-detection hooks installed`、`GnssStatus hooks installed`、
+  `Wi-Fi environment hooks installed`——**Hook 确实装上了**。
+- 数值层面的对照没能在这一步完成：应用拿不到 root，配置快照无法发布（§12.3 有完整证据），
+  模块停在「没有 active 配置」的状态。为此加了 **DEBUG 构建专用**的兜底配置源与一条模型摊平日志（§12.4），
+  但这条路径本身还没跑通。
+
 **仍然不能确定的是真机运行时行为**：反射构造 `SensorEvent` 的三条 fallback 路径、
 不同 ROM 下 `TYPE_STEP_DETECTOR` 的实际投递节奏、`Thread.sleep` 网格在真机上的实际抖动
 （§6 的 996/1004 ms 来自另一套独立实现的外部实测，不是本仓库测的）、
 虚拟 `TYPE_PRESSURE` 传感器能否被目标应用正常枚举、
 `removeMslAltitude` 在真机 Location 对象上的实际可用性（反射失败会静默跳过）、
-以及 ColorOS 16 适配路径的实机命中情况。
+以及 ColorOS 16 适配路径的实机命中情况、§12.4 那条 DEBUG 兜底能否真的把配置喂进去。
 
 
 上真机后建议按下面附录逐条量，并把结果回填到本文件。
+
+## 12. 上机验证：跑到哪一步、卡在哪
+
+这一节记录一次真实上机（Android 15 / x86_64 模拟器），包括失败的部分——失败的原因本身
+就是「本项目的部署前提」的一部分。
+
+### 12.1 环境
+
+- 模拟器 MuMu，Android 15，`ro.product.cpu.abi=x86_64`。我们的产物只有 `arm64-v8a` 与 `armeabi-v7a`，
+  靠模拟器的转译层安装：`adb install` 成功，`versionName=3.0.21-beta-3`、
+  `primaryCpuAbi=arm64-v8a`、`targetSdk=37`、`minSdk=26`。
+- 设备上已装 LSPosed（zygisk，`lspctl status` 显示 `API 102`、`System server: connected`）与 KernelSU。
+
+### 12.2 注入验证（通过）
+
+```
+lspctl module enable --user 0 com.vincenthzr.locationspoofer
+lspctl scope add    --user 0 com.vincenthzr.locationspoofer com.autonavi.minimap
+```
+
+之后启动目标应用，logcat：
+
+```
+I LocationSpoofer: [INJECTED] Hooking package: com.autonavi.minimap process=com.autonavi.minimap
+I LocationSpoofer: [LocationSpoofer] Anti-detection hooks installed
+I LocationSpoofer: [LocationSpoofer] GnssStatus hooks installed (High-Performance Engine)
+I LocationSpoofer: [LocationSpoofer] Wi-Fi environment hooks installed
+```
+
+同一进程里其余 SDK 探测都按预期跳过（`TencentLocation SDK not found`、
+`MyLocationData class found=false`、`BaiduMap class found=false`、Google Play Services 未装）。
+
+**这一步证明**：模块在 Android 15 + LSPosed API 102 上能装载、能按作用域注入目标进程、
+能把各条通道的 hook 装完。**不证明**改写出来的数值对不对——那要有 active 配置。
+
+### 12.3 配置通道（失败，且有解释）
+
+- 模块不自己读配置文件，而是接收框架下发的快照：`FrameworkConfigReceiver` 用
+  `getRemotePreferences("locationspoofer_config")` 拿指针，必要时 `openRemoteFile(...)` 拿超限的 payload。
+  写入方是应用进程，经 libxposed Service 的 `FrameworkConfigStore.commit(...)` 落到框架自己的存储里
+  （`core-data` 的 `FrameworkConfigPublisher` 注释写明「The framework owns storage」）。
+- 应用在这台设备上拿不到 root：KernelSU 只有内核态（`ksud` 能跑、模块列表正常），
+  但**没有 `su` 用户态二进制**——`/system/bin/su`、`/system/xbin/su`、`/data/adb/ksu/bin/su` 都不存在，
+  `ksud install` 报 `No such file or directory`。应用于是停在「需要 Root 权限」页，也不会发布配置。
+- 试过把快照信封手写进 `shared_prefs`（两个可能的名字、正确的属主与 660 权限），
+  模块一直报 `[Config] Framework receive failed: IllegalArgumentException: Unsupported config version`；
+  把内容改成非法 JSON 后**错误信息一模一样**，说明它读到的并不是这两个文件。
+  ⇒ 快照只能由应用侧发布，绕不过去。这条死路不再尝试。
+
+### 12.4 为此加的 DEBUG 兜底（只在 debug 构建里存在）
+
+`LocationHooker` 新增 `startDebugConfigFallback()`：
+
+- 第一行 `if (!BuildConfig.DEBUG) return`——Release 构建里这条路径不存在；
+- debug 构建下起一个守护线程，每 2 s 看 `/data/local/tmp/locationspoofer-debug-config.json`
+  （`lastModified` 变了就重新加载），加载时打一行 `[DebugConfig] 已加载 ...`；
+- 同一处再打一行**模型摊平日志**，把这一轮所有新增模型一次摊开：
+  `pos=… speed=… alt=… hPa=… sat=可见/视野/参与解算 ttff=… nmea=<GP GSV 第 1 页>`，
+  上机时 `adb logcat -s LocationSpoofer` 就能逐项核对，不需要目标应用配合。
+
+这是**测试脚手架**而不是产品功能：它存在的理由只是「在没有可靠 root 的设备上也能验证模型」，
+边界写在代码注释里，Release 构建里不可达。
+
+### 12.5 这一步还没做完的事
+
+- 兜底路径本身没跑通验证（写 JSON → 重启目标进程 → 读回 `[DebugConfig]` 日志）；
+- 有 root 的真机链路（应用发布配置 → 模块收到快照 → 目标应用读到数值）完全没有走过；
+- 所以本轮结论仍然停在「编译 + 单测 + 纯函数数值对照 + 注入验证」这一层。
 
 ---
 

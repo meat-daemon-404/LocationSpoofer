@@ -55,4 +55,80 @@ class SatelliteModelTest {
         val high = SatelliteModel.counts(28, seed, t0).visible
         assertTrue("low=$low high=$high", high - low >= 12)
     }
+
+    // ------------------------------------------------------------------
+    // 天空模型
+    // ------------------------------------------------------------------
+
+    private val templateElevations = FloatArray(32) { 20f + (it * 17 % 60) }
+    private val templateAzimuths = FloatArray(32) { (it * 41 % 360).toFloat() }
+
+    private fun sky(seedValue: Long = seed, atMs: Long = t0): SatelliteModel.Sky =
+        SatelliteModel.sky(
+            SatelliteModel.counts(20, seedValue, atMs),
+            seedValue,
+            atMs,
+            templateElevations,
+            templateAzimuths
+        )
+
+    @Test
+    fun `sky keeps elevations and azimuths inside their physical ranges`() {
+        var t = t0
+        val end = t0 + 3_600_000L
+        while (t <= end) {
+            val s = sky(atMs = t)
+            assertEquals(s.size, s.slot.size)
+            assertEquals(s.size, s.usedInFix.size)
+            for (i in 0 until s.size) {
+                assertTrue("i=$i elev=${s.elevations[i]}", s.elevations[i] in SatelliteModel.MIN_ELEVATION_DEG..SatelliteModel.MAX_ELEVATION_DEG)
+                assertTrue("i=$i az=${s.azimuths[i]}", s.azimuths[i] >= 0f && s.azimuths[i] < 360f)
+            }
+            t += 60_000L
+        }
+    }
+
+    @Test
+    fun `sky marks exactly the announced number of satellites as used in fix`() {
+        var t = t0
+        val end = t0 + 3_600_000L
+        while (t <= end) {
+            val counts = SatelliteModel.counts(20, seed, t)
+            val s = SatelliteModel.sky(counts, seed, t, templateElevations, templateAzimuths)
+            assertEquals(counts.usedInFix, s.usedInFix.count { it })
+            // 参与解算的必须是仰角最高的那几颗
+            val usedMin = (0 until s.size).filter { s.usedInFix[it] }.minOfOrNull { s.elevations[it] } ?: Float.MAX_VALUE
+            val unusedMax = (0 until s.size).filter { !s.usedInFix[it] }.maxOfOrNull { s.elevations[it] } ?: Float.MIN_VALUE
+            assertTrue("usedMin=$usedMin unusedMax=$unusedMax", usedMin >= unusedMax)
+            t += 60_000L
+        }
+    }
+
+    @Test
+    fun `sky motion is continuous, not a sawtooth`() {
+        // 每秒推进一次，仰角单步变化必须很小；(step % 10 - 5) 那种写法会每 10 秒跳 9°
+        var t = t0
+        val end = t0 + 600_000L
+        var previous = sky(atMs = t).elevations
+        t += 1_000L
+        while (t <= end) {
+            val current = sky(atMs = t).elevations
+            for (i in 0 until minOf(previous.size, current.size)) {
+                val jump = kotlin.math.abs(current[i] - previous[i])
+                assertTrue("i=$i jump=$jump t=$t", jump < 0.5f)
+            }
+            previous = current
+            t += 1_000L
+        }
+    }
+
+    @Test
+    fun `different sessions see a different part of the sky`() {
+        // 会话种子不同 -> 轮换起点不同 -> 同一时刻的槽位排布不同
+        val a = sky(seedValue = seed).slot
+        val b = sky(seedValue = seed + 1_000_003L).slot
+        assertTrue("a=${a.toList()} b=${b.toList()}", !a.contentEquals(b))
+        // 轮换本身是排列：一个会话内部槽位不重复
+        assertEquals(a.size, a.toSet().size)
+    }
 }

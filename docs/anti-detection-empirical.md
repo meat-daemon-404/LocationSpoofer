@@ -10,8 +10,8 @@
 一句话结论：**抓到的从来不是 `isFromMockProvider`，而是同一个物理量在不同通道上对不上。**
 
 > 落地状态：§1、§2、§3、§4.1、§4.2、§4.3、§4.5、§5、§6 已全部实现，全量编译通过，
-> `core-geo` 单元测试 41 项 + `xposed` 15 项全绿；另有 §4.4 两条已知边界与 §4.5 末段的
-> 卫星 ID 集合未改（前者需要产品决策，后者是下一个抓手）。
+> `core-geo` 单元测试 45 项 + `xposed` 24 项全绿；另有 §4.4 两条已知边界未改
+> （基准海拔缺省值与静止位置精确，都需要产品决策）。
 > 验证边界见文末「本次改动的验证边界」。
 
 ---
@@ -293,9 +293,38 @@ private val bootStepsBase: Double = 2350.0 + noiseRng.nextInt(2400).toDouble()
 20 个不同场次（不同 `start_timestamp`）在同一时刻报出的 `visible` 落在 18–22、共 5 种取值。
 幅度不大是正常的——真实卫星数本来就窄幅波动，这里要解决的是"不再是同一个数"。
 
-仍未做：`GnssFastMockEngine` 的 `SVID_LIST` 是固定前缀常量（BDS 1-35 / GPS 1-32 / GLONASS 1-24 /
-Galileo 1-36），**每个用户看到的卫星 ID 集合完全相同**；每颗卫星的仰角/方位漂移用的是进程内
-计数器，重启归零。这是下一个同类抓手。
+#### 卫星 ID 集合与天顶几何（同一节的第二笔，已实施）
+
+数量改完还剩一个问题：`GnssFastMockEngine` 里 `SVID_LIST` 是固定前缀常量（BDS 1-35 /
+GPS 1-32 / GLONASS 1-24 / Galileo 1-36），每颗卫星的仰角/方位漂移又用进程内计数器
+（`driftStep = (timeStep + i * 3) % 360`，`elevation = base + (driftStep % 10 - 5)`）——
+于是**所有用户在同一时刻看到的卫星 ID 集合、仰角、方位完全相同，而且几何是每 10 秒跳 9° 的锯齿**。
+
+改法：`core-geo` 新增 `SatelliteModel.sky(counts, seed, epochMs, baseElevations, baseAzimuths)`，
+输出一份天空快照 `Sky(slot, elevations, azimuths, usedInFix)`：
+
+| 量 | 构造 |
+|---|---|
+| 可见槽位 | `start = seed mod N`，槽位按 `(start + i) mod N` 轮换 → 每个会话看到星座的不同一段 |
+| 仰角 | `base[slot] + 9° · sin(2π·t/period + phase)`，截断到 8–88° |
+| 方位 | `base[slot] + (t / azPeriod) · 360 + phase`，对 360 取模 |
+| 参与解算 | 按仰角排名取前 `counts.usedInFix` 颗 |
+
+关键点是**三条通道共用同一份快照**：`GnssStatus`（Android 11+）、`GpsStatus`、
+`onSvStatusChanged` 的六数组签名（Android 7~10）、`Location.extras`、NMEA 全部由同一个
+`SatelliteModel.sky` 驱动。「GnssStatus 里 `usedInFix` 的颗数」与 `satellites_used_in_fix`
+因此必然一致，不会再出现两条通道各说一套。
+
+顺带修掉的第二条：`SystemLocationServiceHooker` 的六数组分支原来硬编码 `svCount = 20`，并用
+`java.util.Random()` 每帧重掷 `cn0 / elevation / azimuth`（同一秒内调两次结果不同、几何完全随机），
+现在由 `GnssFastMockEngine.buildSvArrays(counts, seed)` 生成，与 `GnssStatus` 快照同源。
+
+自检判据：同一场次的 `GpsStatus`、`GnssStatus`、`Location.extras` 三处，卫星 ID 集合必须完全相等；
+不同会话之间必须不相等。
+
+仍未做：每颗卫星的仰角/方位虽然已经随时间连续演化，但 `SVID_LIST` 里的**配对**（星座类型 ↔ SVID）
+仍是固定模板——只是轮换起点随会话变，不是每个会话独立随机。要彻底去模板化就得引入按会话随机的
+星座-编号映射，但那会和「BDS 的 SVID 只能取 1-35」这类真实约束冲突，收益不明显，本轮不做。
 
 ---
 
@@ -412,7 +441,7 @@ nextDispatchMs += dispatchPeriodMs
 | P2 | 派发钉绝对时间网格 | `LocationHooker.kt:663` | 派发间隔抖动 < 5 ms | 已实施（仅逻辑，未上真机） |
 | P2 | 精度基准随区域/时段慢变 | `getJitteredAccuracy()` | 慢变分量周期在分钟级 | 已实施（简单版） |
 | P1 | 卫星数是跨通道对不上的常量 | `SatelliteModel` + `RouteEngine.realisticSatelliteCounts()` | `used_in_fix ≤ visible ≤ in_view` 恒成立；1 小时内取值不止一种 | 已实施 |
-| P2 | 卫星 ID 集合全员相同 | `GnssFastMockEngine.SVID_LIST` | 不同会话的 SVID 集合不相等 | 未改（见 §4.5 末段） |
+| P2 | 卫星 ID 集合与天顶几何全员相同 | `SatelliteModel.sky()` + `GnssFastMockEngine` | 不同会话的 SVID 集合与仰角不相等；三条通道同源 | 已实施 |
 | P2 | 基准海拔缺省 0 导致全员海平面 | `SettingsManager.kt:129` / `LocationRepository` | 不出现跨账号的同一基准值 | 未改（需产品决策，见 §4.4） |
 | P2 | 静止时位置精确等于配置坐标 | `LocationHooker` `isStationary` 分支 | 静止时仍有亚米级漂移 | 未改（见 §4.4） |
 
@@ -420,7 +449,7 @@ nextDispatchMs += dispatchPeriodMs
 
 ## 11. 本次改动的验证边界
 
-本仓库这一轮改了 10 项（§1、§2、§3、§4.1、§4.2、§4.3、§4.5、§5、§6、计步初值），
+本仓库这一轮改了 11 项（§1、§2、§3、§4.1、§4.2、§4.3、§4.5 卫星数与天空几何、§5、§6、计步初值），
 **都没有打 APK、没有上真机**。按验证强度分五类：
 
 
@@ -428,21 +457,23 @@ nextDispatchMs += dispatchPeriodMs
 
 - 用 `kotlin-compiler-embeddable 2.0.0` 直接以命令行编译两个模块的全部 68 个 Kotlin 源文件
   加 1 份 `BuildConfig` 桩（classpath = `android-34/android.jar` + libxposed API jar），
-  产出 362 个 class，**退出码 0、无错误**。
+  产出 365 个 class，**退出码 0、无错误**。
 - `core-geo` 用到的 `BuildConfig` 需要一份桩（真 BuildConfig 由 flavor 生成），
   桩只要 `const val GLOBAL_SCHEME: Boolean`。
 - `app-ui` / `core-data` / `service` 三个模块的 Compose、高德/百度 Maps 依赖在本机拿不到，
   没有本地编译；它们的编译由仓库的 `build` 工作流在 CI 上兜（`assembleScopedDebug`）。
 
-**② 单元测试（`core-geo` 8 个测试类、41 项 + `xposed` 15 项）**
+**② 单元测试（`core-geo` 8 个测试类、45 项 + `xposed` 24 项）**
 
 - 同样绕开 Gradle：编译 `core-geo/src/test` + JUnit 4.13.2 + hamcrest-core 1.3，
-  用 `org.junit.runner.JUnitCore` 直接跑 → **OK (41 tests)**。
-- `xposed` 侧同样方式跑 `RouteEngineTest` → **OK (11 tests)**，其中包含两条既有断言：
+  用 `org.junit.runner.JUnitCore` 直接跑 → **OK (45 tests)**。
+- `xposed` 侧同样方式跑 `RouteEngineTest` / `HotReloadHostTest` / `VendorRegistryTest` /
+  `ColorOs16VendorTest` → **OK (24 tests)**，其中包含两条既有断言：
   显式 `altitude_variation_m = 0` 时海拔恒为基准值（`assertEquals(80.0, …, 0.0)`），
   以及老配置（不写该键）落在 `base ± drift` 区间内。这两条是 §4.1 改动的回归护栏。
-- §4.5 的卫星数在两侧都有护栏：`SatelliteModelTest` 5 项（区间、包含关系、时间起伏、
-  同刻一致、跨场次分散），`RouteEngineTest` 里 1 项从配置 JSON 走完整条链路断言同一组关系。
+- §4.5 的卫星数在两侧都有护栏：`SatelliteModelTest` 9 项（区间、包含关系、时间起伏、
+  同刻一致、跨场次分散，加天空几何的仰角范围、`usedInFix` 计数与仰角排名一致、连续无锯齿、
+  不同会话看到不同星座段），`RouteEngineTest` 里 1 项从配置 JSON 走完整条链路断言同一组关系。
 - 其中 `RoutePathTest` 覆盖开环折返、闭环前进、到站停留与 `GeoMath` 一致性，
   bearing 平滑改动后全部仍通过（关键：位置与朝向在直段上逐位不变）。
 
@@ -470,6 +501,18 @@ nextDispatchMs += dispatchPeriodMs
 - 这一节只证明"模型本身不自相矛盾且不是常量"，**不能证明真机上目标 App 读到的就是这个数**——
   那要等上真机抓包（附录第 4 条）。
 
+**⑥ 数值对照（卫星天空几何，绕开真机直接调纯函数）**
+
+- 同一时刻、不同场次（`seed` = `start_timestamp`）：槽位起始分别是 `0 / 3 / 6 / 25 / 17`，
+  首颗卫星仰角分别是 `85.8° / 46.2° / 65.5° / 35.4° / 67.2°`——**每个会话看到的是星座的不同一段**，
+  而改前所有会话的槽位恒为 `0,1,2,3,…`。
+- 同一场次、连续 10 秒：首颗卫星仰角 `35.37 → 35.57`，单步最大变化 **0.021°/秒**；
+  改前的锯齿是每 10 秒跳 9°，相当于 0.9°/秒且不连续。
+- 方位按 300 秒步进为 `155.9 / 181.0 / 206.2 / 231.3 / 256.5 / 281.6`（单调推进、恒在 `[0,360)`）。
+- `usedInFix` 置位的颗数 = `counts.usedInFix`（16 对 16），且置位的正是仰角排名前 N 颗
+  ——这就是「GnssStatus 的 usedInFix 标志」与「`satellites_used_in_fix` 数值」不会打架的原因。
+- 1 小时 @1 分钟全量检查：仰角落在 `16.00–88.00°`（构造上截断在 8–88），方位越界次数 **0**。
+
 **仍然不能确定的是真机运行时行为**：反射构造 `SensorEvent` 的三条 fallback 路径、
 不同 ROM 下 `TYPE_STEP_DETECTOR` 的实际投递节奏、`Thread.sleep` 网格在真机上的实际抖动
 （§6 的 996/1004 ms 来自另一套独立实现的外部实测，不是本仓库测的）、
@@ -493,3 +536,7 @@ nextDispatchMs += dispatchPeriodMs
 7. **卫星数三口径**：同一时刻断言 `satellites_used_in_fix ≤ satellites ≤ satellites_in_view`，
    且连续 1 小时采样取值不止一种；默认配置（`satellite_count` 缺省 `10`）下尤其要确认
    `used_in_fix` 没有超过 `visible`。
+8. **卫星 ID 与几何同源**：同一时刻对比 `GpsStatus.getSatellites()` 的 SVID 集合、
+   `GnssStatus` 逐颗的 `svid/azimuth/elevation`、`Location.extras` 里的颗数——三处必须自洽；
+   换一个 `start_timestamp` 重跑，SVID 集合与仰角必须不同。同时量相邻两秒的仰角差
+   （应是小量连续变化，不是跳变）。

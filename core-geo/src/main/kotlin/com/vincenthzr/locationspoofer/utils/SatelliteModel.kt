@@ -101,4 +101,98 @@ object SatelliteModel {
         }
         return abs(maxVisible - minVisible) >= 2 || abs(maxUsed - minUsed) >= 2
     }
+
+    // ---------------------------------------------------------------------
+    // 天空模型：每颗卫星的仰角、方位角、是否参与解算
+    // ---------------------------------------------------------------------
+
+    /** 仰角相对基准值的摆动幅度（度） */
+    private const val ELEVATION_SWING_DEG = 9.0
+
+    /** 真机上低于 8° 的卫星基本被地形/掩蔽角挡掉，不再上报 */
+    const val MIN_ELEVATION_DEG = 8f
+    const val MAX_ELEVATION_DEG = 88f
+
+    private const val TWO_PI = 2.0 * Math.PI
+    private const val RAD_TO_DEG = 180.0 / Math.PI
+
+    /**
+     * 某一时刻整个星座的取值。
+     *
+     * @property slot 第 i 颗卫星对应模板里的槽位（轮换后的，跨会话不同）
+     * @property elevations 仰角（度）
+     * @property azimuths 方位角（度，`[0, 360)`）
+     * @property usedInFix 是否参与解算（恰好 `counts.usedInFix` 个为 true）
+     */
+    class Sky(
+        val slot: IntArray,
+        val elevations: FloatArray,
+        val azimuths: FloatArray,
+        val usedInFix: BooleanArray
+    ) {
+        val size: Int get() = elevations.size
+    }
+
+    /**
+     * 生成 `counts.inView` 颗卫星的天顶分布。
+     *
+     * 为什么要单独做一个天空模型，而不是复用一张固定模板：
+     * 1. **固定模板是跨账号指纹**——所有人、所有会话看到的卫星 ID 集合、仰角、方位完全一致；
+     * 2. 模板起点按会话种子轮换，每个会话"在视野里"的那一段星座不同，但单颗卫星的
+     *    类型与 SVID 配对关系不变（合法性由调用方的模板保证）；
+     * 3. 仰角/方位角用**连续**的三角函数推进，不会像 `(step % 10 - 5)` 那样出现
+     *    每 10 秒一次 9° 的锯齿跳变。
+     *
+     * @param baseElevations 模板仰角（度），长度须大于等于 `counts.inView`
+     * @param baseAzimuths 模板方位角（度），同上
+     */
+    fun sky(
+        counts: Counts,
+        seed: Long,
+        epochMs: Long,
+        baseElevations: FloatArray,
+        baseAzimuths: FloatArray
+    ): Sky {
+        val templateSize = minOf(baseElevations.size, baseAzimuths.size)
+        require(templateSize > 0) { "template must not be empty" }
+        val n = counts.inView.coerceIn(MIN_USED_IN_FIX, templateSize)
+        val t = epochMs / 1000.0
+
+        // 会话级的轮换起点与轨道周期：同一次模拟内恒定，不同会话之间不同
+        val start = floorMod(seed, templateSize.toLong()).toInt()
+        val elevationPeriodSec = 1500.0 + (floorMod(seed ushr 3, 1500L))
+        val azimuthPeriodSec = 4200.0 + (floorMod(seed ushr 7, 3000L))
+        val basePhase = floorMod(seed ushr 11, 6283L) / 1000.0
+
+        val slot = IntArray(n)
+        val elevations = FloatArray(n)
+        val azimuths = FloatArray(n)
+        for (i in 0 until n) {
+            val s = (start + i) % templateSize
+            slot[i] = s
+            val phase = basePhase + i * 0.63
+            val elevation = baseElevations[s] + ELEVATION_SWING_DEG * kotlin.math.sin(TWO_PI * t / elevationPeriodSec + phase)
+            elevations[i] = elevation.toFloat().coerceIn(MIN_ELEVATION_DEG, MAX_ELEVATION_DEG)
+            val azimuth = baseAzimuths[s] + (t / azimuthPeriodSec) * 360.0 + phase * RAD_TO_DEG
+            azimuths[i] = floorModD(azimuth, 360.0).toFloat()
+        }
+
+        // 参与解算的就是仰角最高的那几颗（真机按仰角门限挑选，这里直接用排名保证数量一致）
+        val usedInFix = BooleanArray(n)
+        val order = (0 until n).sortedByDescending { elevations[it] }
+        val want = counts.usedInFix.coerceIn(0, n)
+        for (k in 0 until want) usedInFix[order[k]] = true
+
+        return Sky(slot, elevations, azimuths, usedInFix)
+    }
+
+    private fun floorMod(value: Long, modulus: Long): Long {
+        val r = value % modulus
+        return if (r < 0L) r + modulus else r
+    }
+
+    private fun floorModD(value: Double, modulus: Double): Double {
+        val r = value % modulus
+        return if (r < 0.0) r + modulus else r
+    }
 }

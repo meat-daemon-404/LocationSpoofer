@@ -16,6 +16,7 @@
 
 package com.vincenthzr.locationspoofer.xposed.hooks
 
+import com.vincenthzr.locationspoofer.utils.SatelliteModel
 import com.vincenthzr.locationspoofer.xposed.LocationHooker
 import com.vincenthzr.locationspoofer.xposed.utils.*
 import com.vincenthzr.locationspoofer.xposed.hooks.*
@@ -88,11 +89,12 @@ internal fun LocationHooker.hookGnssStatus(classLoader: ClassLoader) {
                                 val statusObj = innerChain.args[0]
                                 val config = readConfig()
                                 if (config != null && config.optBoolean("active", false)) {
-                                    val count = RouteEngine.realisticSatelliteCounts(config).inView
+                                    val satCounts = RouteEngine.realisticSatelliteCounts(config)
                                     val enableJitter = config.optBoolean("enable_jitter", true)
                                     val spoofedStatus = GnssFastMockEngine.getOrCreateSpoofedGnssStatus(
                                         classLoader = clazz.classLoader ?: classLoader,
-                                        targetCount = count,
+                                        counts = satCounts,
+                                        seed = config.optLong("start_timestamp", 0L),
                                         enableJitter = enableJitter,
                                         fallbackOriginalObj = statusObj
                                     )
@@ -185,11 +187,15 @@ internal fun LocationHooker.hookGnssStatus(classLoader: ClassLoader) {
                 val result = chain.proceed(chain.args.toTypedArray())
                 val config = readConfig()
                 if (config != null && config.optBoolean("active", false)) {
-                    val count = RouteEngine.realisticSatelliteCounts(config).inView
+                    val satCounts = RouteEngine.realisticSatelliteCounts(config)
                     val statusObj = result ?: chain.args.firstOrNull()
                     if (statusObj != null) {
                         try {
-                            val satellites = GnssFastMockEngine.getOrCreateSpoofedGpsSatellites(classLoader, count)
+                            val satellites = GnssFastMockEngine.getOrCreateSpoofedGpsSatellites(
+                                classLoader,
+                                satCounts,
+                                config.optLong("start_timestamp", 0L)
+                            )
                             XposedHelpers.setObjectField(statusObj, "mSatellites", satellites)
                         } catch (_: Throwable) {}
                     }
@@ -208,8 +214,11 @@ internal fun LocationHooker.hookGnssStatus(classLoader: ClassLoader) {
             ) { chain, method ->
                 val config = readConfig()
                 if (config != null && config.optBoolean("active", false)) {
-                    val count = RouteEngine.realisticSatelliteCounts(config).inView
-                    return@hookMethod GnssFastMockEngine.getOrCreateSpoofedGpsSatellites(classLoader, count)
+                    return@hookMethod GnssFastMockEngine.getOrCreateSpoofedGpsSatellites(
+                        classLoader,
+                        RouteEngine.realisticSatelliteCounts(config),
+                        config.optLong("start_timestamp", 0L)
+                    )
                 }
                 return@hookMethod chain.proceed(chain.args.toTypedArray())
             }
@@ -227,8 +236,10 @@ internal fun LocationHooker.hookGnssStatus(classLoader: ClassLoader) {
 
 internal fun LocationHooker.createSpoofedGpsSatellites(classLoader: ClassLoader): Iterable<Any> {
     val config = readConfig()
-    val count = config?.let { RouteEngine.realisticSatelliteCounts(it).inView } ?: 20
-    return GnssFastMockEngine.getOrCreateSpoofedGpsSatellites(classLoader, count)
+    val counts = config?.let { RouteEngine.realisticSatelliteCounts(it) }
+        ?: SatelliteModel.counts(20, 0L, System.currentTimeMillis())
+    val seed = config?.optLong("start_timestamp", 0L) ?: 0L
+    return GnssFastMockEngine.getOrCreateSpoofedGpsSatellites(classLoader, counts, seed)
 }
 
 // GNSS 卫星矩阵数据结构（预留，暂无调用方）

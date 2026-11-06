@@ -20,6 +20,7 @@ import com.vincenthzr.locationspoofer.xposed.hooks.vendor.VendorRegistry
 import android.os.IBinder
 import android.os.IInterface
 import android.util.Log
+import com.vincenthzr.locationspoofer.utils.SatelliteModel
 import com.vincenthzr.locationspoofer.xposed.LocationHooker
 import com.vincenthzr.locationspoofer.xposed.hooks.vendor.SystemComponent
 import com.vincenthzr.locationspoofer.xposed.hooks.vendor.SystemClassLocator
@@ -294,11 +295,13 @@ private fun LocationHooker.startSystemLocationHeartbeat(classLoader: ClassLoader
 
                 // 2. 推送 20+ 真实卫星星座给目标应用 IGnssStatusListener (GnssStatus / GpsStatus)
                 if (activeGnssStatusBinders.isNotEmpty()) {
-                    val satCount = RouteEngine.realisticSatelliteCounts(config).inView
+                    val satCounts = RouteEngine.realisticSatelliteCounts(config)
+                    val satSeed = config.optLong("start_timestamp", 0L)
                     val enableJitter = config.optBoolean("enable_jitter", true)
                     val gnssStatus = GnssFastMockEngine.getOrCreateSpoofedGnssStatus(
                         classLoader,
-                        satCount,
+                        satCounts,
+                        satSeed,
                         enableJitter,
                         null
                     )
@@ -309,7 +312,7 @@ private fun LocationHooker.startSystemLocationHeartbeat(classLoader: ClassLoader
                         }
                         val callback = info.listener
                         try {
-                            dispatchGnssStatus(callback, gnssStatus, classLoader)
+                            dispatchGnssStatus(callback, gnssStatus, classLoader, satCounts, satSeed)
                         } catch (e: Throwable) {
                             if (!binder.isBinderAlive) {
                                 activeGnssStatusBinders.remove(binder)
@@ -345,7 +348,13 @@ private fun LocationHooker.startSystemLocationHeartbeat(classLoader: ClassLoader
 }
 
 /** 向 IGnssStatusListener 代理对象主动反射调用 onSvStatusChanged，支持 Android 11+ (GnssStatus) 与 Android 7~10 */
-private fun LocationHooker.dispatchGnssStatus(listener: Any, gnssStatus: Any?, classLoader: ClassLoader) {
+private fun LocationHooker.dispatchGnssStatus(
+    listener: Any,
+    gnssStatus: Any?,
+    classLoader: ClassLoader,
+    counts: SatelliteModel.Counts = SatelliteModel.counts(20, 0L, System.currentTimeMillis()),
+    seed: Long = 0L
+) {
     val clazz = listener.javaClass
 
     // 确保 GNSS 引擎启动状态已告知客户端
@@ -362,33 +371,23 @@ private fun LocationHooker.dispatchGnssStatus(listener: Any, gnssStatus: Any?, c
             if (svMethod.parameterCount == 1) {
                 // Android 11+ 标准：GnssStatus 对象 (Parcelable 跨进程分发)
                 val statusObj = gnssStatus ?: GnssFastMockEngine.getOrCreateSpoofedGnssStatus(
-                    classLoader, 20, true, null
+                    classLoader, counts, seed, true, null
                 )
                 if (statusObj != null) {
                     svMethod.invoke(listener, statusObj)
                 }
             } else if (svMethod.parameterCount == 6) {
-                // Android 7~10 兼容：6 数组签名
-                val svCount = 20
-                val svidWithFlags = IntArray(svCount)
-                val cn0DbHz = FloatArray(svCount)
-                val elevations = FloatArray(svCount)
-                val azimuths = FloatArray(svCount)
-                val carrierFrequencies = FloatArray(svCount)
-                val rng = java.util.Random()
-                for (i in 0 until svCount) {
-                    val svid = when {
-                        i < 10 -> i + 1
-                        i < 16 -> (i - 10) + 201
-                        else -> (i - 16) + 65
-                    }
-                    svidWithFlags[i] = (svid shl 4) or 0x07
-                    cn0DbHz[i] = 30f + rng.nextFloat() * 12f
-                    elevations[i] = 20f + rng.nextFloat() * 65f
-                    azimuths[i] = rng.nextFloat() * 360f
-                    carrierFrequencies[i] = 1575420000f
-                }
-                svMethod.invoke(listener, svCount, svidWithFlags, cn0DbHz, elevations, azimuths, carrierFrequencies)
+                // Android 7~10 兼容：6 数组签名（与 GnssStatus 共用同一份天空模型）
+                val arrays = GnssFastMockEngine.buildSvArrays(counts, seed)
+                svMethod.invoke(
+                    listener,
+                    arrays.size,
+                    arrays.svidWithFlags,
+                    arrays.cn0DbHz,
+                    arrays.elevations,
+                    arrays.azimuths,
+                    arrays.carrierFrequencies
+                )
             }
         } catch (e: Throwable) {
             logLoc("[SysLoc] dispatch onSvStatusChanged error: $e")
@@ -865,13 +864,16 @@ internal fun LocationHooker.hookSystemLocationService(classLoader: ClassLoader) 
                                     } catch (_: Throwable) {}
 
                                     // 立即向新注册的监听器派发一次卫星数据，避免等待心跳周期
+                                    val regCounts = RouteEngine.realisticSatelliteCounts(config)
+                                    val regSeed = config.optLong("start_timestamp", 0L)
                                     val gnssStatus = GnssFastMockEngine.getOrCreateSpoofedGnssStatus(
                                         classLoader,
-                                        RouteEngine.realisticSatelliteCounts(config).inView,
+                                        regCounts,
+                                        regSeed,
                                         config.optBoolean("enable_jitter", true),
                                         null
                                     )
-                                    dispatchGnssStatus(callback, gnssStatus, classLoader)
+                                    dispatchGnssStatus(callback, gnssStatus, classLoader, regCounts, regSeed)
                                     hookGnssStatusListenerCallback(callback)
 
                                     logLoc("[SysLoc] Registered & dispatched target GNSS status callback for $pkgName (active: ${activeGnssStatusBinders.size})"
@@ -1478,14 +1480,16 @@ private fun LocationHooker.hookGnssStatusListenerCallback(listener: Any) {
             val config = readConfig()
             if (config != null && config.optBoolean("active", false)) {
                 val args = chain.args
-                val satCount = RouteEngine.realisticSatelliteCounts(config).inView
+                val satCounts = RouteEngine.realisticSatelliteCounts(config)
+                val satSeed = config.optLong("start_timestamp", 0L)
                 val enableJitter = config.optBoolean("enable_jitter", true)
 
                 if (args.size == 1) {
                     // Android 11+ 标准：GnssStatus 单参数
                     val fakeStatus = GnssFastMockEngine.getOrCreateSpoofedGnssStatus(
                         clazz.classLoader ?: ClassLoader.getSystemClassLoader(),
-                        satCount,
+                        satCounts,
+                        satSeed,
                         enableJitter,
                         args[0]
                     )
@@ -1494,34 +1498,16 @@ private fun LocationHooker.hookGnssStatusListenerCallback(listener: Any) {
                     }
                 } else if (args.size >= 6) {
                     // Android 7~10 兼容：6 个数组参数 (svCount, svidWithFlags, cn0DbHz, elevations, azimuths, carrierFrequencies)
-                    val svCount = satCount.coerceIn(4, 32)
-                    val svidWithFlags = IntArray(svCount)
-                    val cn0DbHz = FloatArray(svCount)
-                    val elevations = FloatArray(svCount)
-                    val azimuths = FloatArray(svCount)
-                    val carrierFrequencies = FloatArray(svCount)
-
-                    val rng = java.util.Random()
-                    for (i in 0 until svCount) {
-                        val svid = when {
-                            i < 10 -> i + 1
-                            i < 16 -> (i - 10) + 201
-                            else -> (i - 16) + 65
-                        }
-                        svidWithFlags[i] = (svid shl 4) or 0x07
-                        cn0DbHz[i] = 30f + rng.nextFloat() * 12f
-                        elevations[i] = 20f + rng.nextFloat() * 65f
-                        azimuths[i] = rng.nextFloat() * 360f
-                        carrierFrequencies[i] = 1575420000f
-                    }
+                    val arrays = GnssFastMockEngine.buildSvArrays(satCounts, satSeed, enableJitter)
+                    val svCount = arrays.size
 
                     val newArgs = args.toMutableList()
                     newArgs[0] = svCount
-                    newArgs[1] = svidWithFlags
-                    newArgs[2] = cn0DbHz
-                    newArgs[3] = elevations
-                    newArgs[4] = azimuths
-                    newArgs[5] = carrierFrequencies
+                    newArgs[1] = arrays.svidWithFlags
+                    newArgs[2] = arrays.cn0DbHz
+                    newArgs[3] = arrays.elevations
+                    newArgs[4] = arrays.azimuths
+                    newArgs[5] = arrays.carrierFrequencies
                     return@hookAllMethods chain.proceed(newArgs.toTypedArray())
                 }
             }

@@ -146,8 +146,27 @@ internal fun LocationHooker.getJitteredLocation(
     return Pair(baseLat + hookDriftLat, baseLng + hookDriftLng)
 }
 
+/** 精度基准值（米）与慢速摆动的幅度：真机开阔地常见 4~8 m，并随天空遮挡缓慢变化 */
+private const val ACCURACY_BASE_M = 4.6
+private const val ACCURACY_SLOW_M = 1.4
+private const val ACCURACY_MIN_M = 3.0
+private const val ACCURACY_MAX_M = 9.0
+
+/** 精度慢速摆动：周期 4~25 分钟，进程内随机种子，不参与跨进程一致性 */
+private val accuracyNoise =
+    com.vincenthzr.locationspoofer.utils.MotionRealism.SmoothNoise(
+        java.util.Random().nextLong(),
+        240.0,
+        1500.0
+    )
+
 internal fun LocationHooker.getJitteredAccuracy(): Float {
-    // 精度值在真实优良室外环境(1.5m-3.5m)微弱起伏，运动与地图软件将判定为满格绿色强信号
+    // 原实现恒定落在 1.5~3.5 m 的窄带里：整场模拟的精度永远是"满格绿色强信号"，
+    // 连续几十分钟都是同一个分布，反而比真机更整齐。改用 OU 游走（秒级抖动）
+    // 叠加一个分钟级的慢速摆动，区间放宽到 3~9 m。
     hookAccuracyDrift += 0.1 * rng.nextGaussian() - 0.05 * hookAccuracyDrift
-    return (2.2 + hookAccuracyDrift).coerceIn(1.5, 3.5).toFloat()
+    val slow = accuracyNoise.value(android.os.SystemClock.elapsedRealtimeNanos() / 1e9)
+    return (ACCURACY_BASE_M + hookAccuracyDrift + ACCURACY_SLOW_M * slow)
+        .coerceIn(ACCURACY_MIN_M, ACCURACY_MAX_M)
+        .toFloat()
 }

@@ -85,12 +85,19 @@ object RouteEngine {
     }
 
     /**
-     * 当前位置的海拔：基准海拔 ± 变化范围内随地形起伏，叠加随机强度对应的缓慢漂移（见 [AltitudeModel]），
-     * 各进程对同一时刻给出一致的值。旧版配置没有变化范围字段时，按随机强度的漂移幅度处理。
+     * 当前位置的海拔：基准海拔 ± 变化范围内随地形起伏，叠加缓慢漂移（见 [AltitudeModel]），
+     * 各进程对同一时刻给出一致的值。旧版配置没有变化范围字段时，按漂移幅度处理。
+     *
+     * 漂移幅度不再直接取真实度档位：档位 OFF 的幅度是 0，海拔就退化成只由坐标决定的地形函数，
+     * 原地模拟时是一条常量直线（见 [MotionRealism.MIN_ALTITUDE_DRIFT_M]）。这里用带下限的
+     * 档位幅度，使"没调过真实度"的配置也有随时间变化的分量；而 `altitude_variation_m = 0`
+     * 是用户显式要求固定海拔，仍原样返回基准值。
      */
     fun realisticAltitude(config: JSONObject, now: Long = System.currentTimeMillis()): Double {
         val base = config.optDouble("altitude", 25.0)
-        val drift = MotionRealism.Level.fromId(config.optInt("realism_level", MotionRealism.Level.OFF.id)).altitudeAmplitudeM
+        val drift = MotionRealism.altitudeDriftM(
+            MotionRealism.Level.fromId(config.optInt("realism_level", MotionRealism.Level.OFF.id))
+        )
         val variation = config.optDouble("altitude_variation_m", drift)
         if (variation <= 0.0) return base
         val pos = calculateCurrentPosition(config, now)

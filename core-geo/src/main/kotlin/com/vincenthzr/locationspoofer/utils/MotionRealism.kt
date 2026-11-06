@@ -43,6 +43,19 @@ object MotionRealism {
     const val DEFAULT_SPEED_FLUCTUATION_PCT = 10
     const val MAX_SPEED_FLUCTUATION_PCT = 30
 
+    /**
+     * 海拔漂移的幅度下限（±米），与真实度档位无关。
+     *
+     * [Level.OFF] 的 [Level.altitudeAmplitudeM] 是 0，此时 [AltitudeModel.altitude] 只剩地形分量，
+     * 而地形只由坐标决定——原地模拟或者站在原地不动时，海拔是一条完全水平的直线。真机的高度计
+     * 即使静止也有米级的缓慢起伏（气压计噪声 + 天气），"海拔一整段完全不变"本身就是可被判别的特征。
+     * 因此任何档位都保留下限的漂移分量；用户显式把变化范围设为 0 时仍然完全固定（见 [RouteEngine]）。
+     */
+    const val MIN_ALTITUDE_DRIFT_M = 2.0
+
+    /** 实际使用的地形漂移幅度：不低于 [MIN_ALTITUDE_DRIFT_M] */
+    fun altitudeDriftM(level: Level): Double = maxOf(level.altitudeAmplitudeM, MIN_ALTITUDE_DRIFT_M)
+
     /** 速度变化中由步频承担的比例，其余由步幅承担（步幅 = 速度 / 步频） */
     private const val CADENCE_SHARE_OF_SPEED = 0.4
     private const val RUN_SPEED_THRESHOLD = 2.2

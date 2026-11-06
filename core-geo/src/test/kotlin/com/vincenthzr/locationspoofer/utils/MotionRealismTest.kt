@@ -99,4 +99,28 @@ class MotionRealismTest {
         assertTrue(a === b)
         assertTrue(a !== c)
     }
+
+    @Test
+    fun `altitude drift never falls back to zero, whatever the realism level`() {
+        // OFF 档的 altitudeAmplitudeM 是 0；直接用它会让原地模拟的海拔变成一条常量直线。
+        assertEquals(MotionRealism.MIN_ALTITUDE_DRIFT_M, MotionRealism.altitudeDriftM(MotionRealism.Level.OFF), 0.0)
+        assertEquals(MotionRealism.MIN_ALTITUDE_DRIFT_M, MotionRealism.altitudeDriftM(MotionRealism.Level.LOW), 0.0)
+        // 高于下限的档位保持原值，行为不变
+        assertEquals(3.0, MotionRealism.altitudeDriftM(MotionRealism.Level.MEDIUM), 0.0)
+        assertEquals(5.0, MotionRealism.altitudeDriftM(MotionRealism.Level.HIGH), 0.0)
+
+        // 下限必须真的产生随时间变化的量：站在原地 10 分钟，海拔不能是一条直线
+        val t0 = start
+        val values = (0..600 step 10).map {
+            AltitudeModel.altitude(
+                50.0,
+                MotionRealism.MIN_ALTITUDE_DRIFT_M,
+                MotionRealism.altitudeDriftM(MotionRealism.Level.OFF),
+                23.1066,
+                113.3245,
+                t0 + it * 1000L
+            )
+        }
+        assertTrue("span ${values.max() - values.min()}", values.max() - values.min() > 0.2)
+    }
 }

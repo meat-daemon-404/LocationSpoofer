@@ -658,9 +658,20 @@ class LocationHooker : XposedModule() {
                     // 后台定时器只读内存中的配置，不轮询配置文件
                     val worker = Thread {
                         val workerThread = Thread.currentThread()
+                        val dispatchPeriodMs = 1_000L
+                        var nextDispatchMs = android.os.SystemClock.elapsedRealtime() + dispatchPeriodMs
                         while (configWorker === workerThread && !workerThread.isInterrupted) {
                             try {
-                                Thread.sleep(1_000L)
+                                // 按绝对时间网格派发：Thread.sleep(1000) 是相对量，本轮的执行耗时和
+                                // 调度延迟都会累加进间隔里，跑一段时间后派发时刻整体后移、间隔变成
+                                // 1005~1015 ms。钉在网格上时相邻两次派发的间隔稳定在一个周期附近。
+                                val waitMs = nextDispatchMs - android.os.SystemClock.elapsedRealtime()
+                                if (waitMs > 0L) Thread.sleep(waitMs)
+                                nextDispatchMs += dispatchPeriodMs
+                                // 落后超过一个周期（进程被挂起过、设备休眠过）时重新对齐，避免连续补发
+                                if (android.os.SystemClock.elapsedRealtime() - nextDispatchMs > dispatchPeriodMs) {
+                                    nextDispatchMs = android.os.SystemClock.elapsedRealtime() + dispatchPeriodMs
+                                }
                                 val newConfig = readConfig()
 
                                 // 若系统核心服务在初次加载时尚未初始化完成，在后台轮询线程中重试挂载，直至成功
@@ -717,7 +728,7 @@ class LocationHooker : XposedModule() {
                                     val pushLng = if (isStationary) targetLng else getJitteredLocation(targetLat, targetLng).second
                                     val pushSpeed = motion.speed
                                     val pushBearing = motion.bearing
-                                    val pushAccuracy = if (isStationary) 2.5f else getJitteredAccuracy()
+                                    val pushAccuracy = if (isStationary) getJitteredAccuracy() * 0.7f else getJitteredAccuracy()
                                     val pushAltitude = RouteEngine.realisticAltitude(newConfig)
 
                                     val mainHandler = try {

@@ -294,7 +294,7 @@ private fun LocationHooker.startSystemLocationHeartbeat(classLoader: ClassLoader
 
                 // 2. 推送 20+ 真实卫星星座给目标应用 IGnssStatusListener (GnssStatus / GpsStatus)
                 if (activeGnssStatusBinders.isNotEmpty()) {
-                    val satCount = config.optInt("satellite_count", 20)
+                    val satCount = RouteEngine.realisticSatelliteCounts(config).inView
                     val enableJitter = config.optBoolean("enable_jitter", true)
                     val gnssStatus = GnssFastMockEngine.getOrCreateSpoofedGnssStatus(
                         classLoader,
@@ -460,7 +460,7 @@ private fun LocationHooker.buildMockNmeaSentences(
     val speedStr = String.format(java.util.Locale.US, "%.2f", speedKnots)
     val bearingStr = String.format(java.util.Locale.US, "%.1f", motion.bearing)
     val altStr = String.format(java.util.Locale.US, "%.1f", altitude)
-    val satCount = config.optInt("satellite_count", 20)
+    val satCount = RouteEngine.realisticSatelliteCounts(config).usedInFix
 
     // $GPRMC
     val rmc = "GPRMC,$timeUtc,A,$latStr,$latHem,$lngStr,$lngHem,$speedStr,$bearingStr,$dateUtc,,,A"
@@ -867,7 +867,7 @@ internal fun LocationHooker.hookSystemLocationService(classLoader: ClassLoader) 
                                     // 立即向新注册的监听器派发一次卫星数据，避免等待心跳周期
                                     val gnssStatus = GnssFastMockEngine.getOrCreateSpoofedGnssStatus(
                                         classLoader,
-                                        config.optInt("satellite_count", 20),
+                                        RouteEngine.realisticSatelliteCounts(config).inView,
                                         config.optBoolean("enable_jitter", true),
                                         null
                                     )
@@ -1478,7 +1478,7 @@ private fun LocationHooker.hookGnssStatusListenerCallback(listener: Any) {
             val config = readConfig()
             if (config != null && config.optBoolean("active", false)) {
                 val args = chain.args
-                val satCount = config.optInt("satellite_count", 20)
+                val satCount = RouteEngine.realisticSatelliteCounts(config).inView
                 val enableJitter = config.optBoolean("enable_jitter", true)
 
                 if (args.size == 1) {

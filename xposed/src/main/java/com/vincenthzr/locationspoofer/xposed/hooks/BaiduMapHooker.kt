@@ -247,7 +247,7 @@ internal fun LocationHooker.hookBaiduSDK(classLoader: ClassLoader) {
                 var result = chain.proceed(chain.args.toTypedArray())
                 val config = readConfig()
                 if (config != null && config.optBoolean("active", false)) {
-                    result = config.optInt("satellite_count", 20)
+                    result = RouteEngine.realisticSatelliteCounts(config).visible
                 }
                 return@hookAllMethods result
             }
@@ -320,7 +320,7 @@ internal fun LocationHooker.hookBaiduSDK(classLoader: ClassLoader) {
                 try { XposedHelpers.callMethod(bdLoc, "setRadius", getJitteredAccuracy()) } catch (_: Throwable) {}
                 try { XposedHelpers.callMethod(bdLoc, "setSpeed", motion.speed * 3.6f) } catch (_: Throwable) {}
                 try { XposedHelpers.callMethod(bdLoc, "setDirection", motion.bearing) } catch (_: Throwable) {}
-                try { XposedHelpers.callMethod(bdLoc, "setSatelliteNumber", 20) } catch (_: Throwable) {}
+                try { XposedHelpers.callMethod(bdLoc, "setSatelliteNumber", RouteEngine.realisticSatelliteCounts(config).visible) } catch (_: Throwable) {}
                 try { XposedHelpers.callMethod(bdLoc, "setGpsCheckStatus", 1) } catch (_: Throwable) {}
                 try { XposedHelpers.callMethod(bdLoc, "setMockGps", 0) } catch (_: Throwable) {}
                 try { XposedHelpers.callMethod(bdLoc, "setTime", java.text.SimpleDateFormat("yyyy-MM-dd HH:mm:ss", java.util.Locale.US).format(java.util.Date())) } catch (_: Throwable) {}
@@ -372,7 +372,7 @@ internal fun LocationHooker.hookBaiduSDK(classLoader: ClassLoader) {
                                     try { XposedHelpers.callMethod(bdLoc, "setRadius", getJitteredAccuracy()) } catch (_: Throwable) {}
                                     try { XposedHelpers.callMethod(bdLoc, "setSpeed", motion.speed * 3.6f) } catch (_: Throwable) {}
                                     try { XposedHelpers.callMethod(bdLoc, "setDirection", motion.bearing) } catch (_: Throwable) {}
-                                    try { XposedHelpers.callMethod(bdLoc, "setSatelliteNumber", 20) } catch (_: Throwable) {}
+                                    try { XposedHelpers.callMethod(bdLoc, "setSatelliteNumber", RouteEngine.realisticSatelliteCounts(config).visible) } catch (_: Throwable) {}
                                     try { XposedHelpers.callMethod(bdLoc, "setGpsCheckStatus", 1) } catch (_: Throwable) {}
                                     try { XposedHelpers.callMethod(bdLoc, "setMockGps", 0) } catch (_: Throwable) {}
                                     try { XposedHelpers.callMethod(bdLoc, "setTime", java.text.SimpleDateFormat("yyyy-MM-dd HH:mm:ss", java.util.Locale.US).format(java.util.Date())) } catch (_: Throwable) {}
@@ -435,7 +435,7 @@ internal fun LocationHooker.hookBaiduSDK(classLoader: ClassLoader) {
                             try { XposedHelpers.callMethod(bdLoc, "setCoorType", injCoorType) } catch (_: Throwable) {}
                             try { XposedHelpers.setObjectField(bdLoc, "mCoorType", injCoorType) } catch (_: Throwable) {}
                             try { XposedHelpers.callMethod(bdLoc, "setRadius", getJitteredAccuracy()) } catch (_: Throwable) {}
-                            try { XposedHelpers.callMethod(bdLoc, "setSatelliteNumber", 20) } catch (_: Throwable) {}
+                            try { XposedHelpers.callMethod(bdLoc, "setSatelliteNumber", RouteEngine.realisticSatelliteCounts(config).visible) } catch (_: Throwable) {}
                             return@hookAllMethods bdLoc
                         }
                     }

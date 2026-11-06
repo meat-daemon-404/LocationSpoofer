@@ -217,10 +217,10 @@ internal fun LocationHooker.hookLocationProviders(classLoader: ClassLoader, curr
                                                             firstArg.elapsedRealtimeNanos = android.os.SystemClock.elapsedRealtimeNanos()
                                                             try {
                                                                 val extras = firstArg.extras ?: android.os.Bundle()
-                                                                val satCount = config.optInt("satellite_count", 20)
-                                                                extras.putInt("satellites", satCount)
-                                                                extras.putInt("satellites_in_view", satCount)
-                                                                extras.putInt("satellites_used_in_fix", satCount.coerceAtLeast(12))
+                                                                val satCounts = RouteEngine.realisticSatelliteCounts(config)
+                                                                extras.putInt("satellites", satCounts.usedInFix)
+                                                                extras.putInt("satellites_in_view", satCounts.inView)
+                                                                extras.putInt("satellites_used_in_fix", satCounts.usedInFix)
                                                                 extras.putBoolean("mockLocation", false)
                                                                 firstArg.extras = extras
                                                             } catch (_: Throwable) {}
@@ -252,11 +252,11 @@ internal fun LocationHooker.hookLocationProviders(classLoader: ClassLoader, curr
                                                                     loc.elapsedRealtimeNanos = android.os.SystemClock.elapsedRealtimeNanos()
                                                                     try {
                                                                         val extras = loc.extras ?: android.os.Bundle()
-                                                                        val satCount = config.optInt("satellite_count", 20)
-                                                                        extras.putInt("satellites", satCount)
-                                                                        extras.putInt("satellites_in_view", satCount)
-                                                                        extras.putInt("satellites_used_in_fix", satCount.coerceAtLeast(12))
-                                                                        extras.putInt("satellites_visible", satCount)
+                                                                        val satCounts = RouteEngine.realisticSatelliteCounts(config)
+                                                                        extras.putInt("satellites", satCounts.usedInFix)
+                                                                        extras.putInt("satellites_in_view", satCounts.inView)
+                                                                        extras.putInt("satellites_used_in_fix", satCounts.usedInFix)
+                                                                        extras.putInt("satellites_visible", satCounts.inView)
                                                                         extras.putBoolean("mockLocation", false)
                                                                         loc.extras = extras
                                                                     } catch (_: Throwable) {}
@@ -330,11 +330,11 @@ internal fun LocationHooker.hookLocationProviders(classLoader: ClassLoader, curr
                             XposedHelpers.callMethod(fakeLoc, "setElapsedRealtimeNanos", android.os.SystemClock.elapsedRealtimeNanos())
                             try {
                                 val extras = android.os.Bundle().apply {
-                                    val satCount = config.optInt("satellite_count", 20)
-                                    putInt("satellites", satCount)
-                                    putInt("satellites_in_view", satCount)
-                                    putInt("satellites_used_in_fix", satCount.coerceAtLeast(12))
-                                    putInt("satellites_visible", satCount)
+                                    val satCounts = RouteEngine.realisticSatelliteCounts(config)
+                                    putInt("satellites", satCounts.usedInFix)
+                                    putInt("satellites_in_view", satCounts.inView)
+                                    putInt("satellites_used_in_fix", satCounts.usedInFix)
+                                    putInt("satellites_visible", satCounts.inView)
                                     putBoolean("mockLocation", false)
                                 }
                                 XposedHelpers.callMethod(fakeLoc, "setExtras", extras)
@@ -405,11 +405,11 @@ internal fun LocationHooker.hookLocationProviders(classLoader: ClassLoader, curr
                     )
                     try {
                         val extras = android.os.Bundle().apply {
-                            val satCount = config.optInt("satellite_count", 20)
-                            putInt("satellites", satCount)
-                            putInt("satellites_in_view", satCount)
-                            putInt("satellites_used_in_fix", satCount.coerceAtLeast(12))
-                            putInt("satellites_visible", satCount)
+                            val satCounts = RouteEngine.realisticSatelliteCounts(config)
+                            putInt("satellites", satCounts.usedInFix)
+                            putInt("satellites_in_view", satCounts.inView)
+                            putInt("satellites_used_in_fix", satCounts.usedInFix)
+                            putInt("satellites_visible", satCounts.inView)
                             putBoolean("mockLocation", false)
                         }
                         XposedHelpers.callMethod(fakeLoc, "setExtras", extras)

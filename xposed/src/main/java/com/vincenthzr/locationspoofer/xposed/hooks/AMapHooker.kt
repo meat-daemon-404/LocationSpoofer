@@ -58,7 +58,7 @@ internal fun LocationHooker.hookAMapSDK(classLoader: ClassLoader) {
                                 try { XposedHelpers.setDoubleField(amapLoc, "mLongitude", motion.lng) } catch (_: Throwable) {}
                                 try { XposedHelpers.callMethod(amapLoc, "setLocationType", 1) } catch (_: Throwable) {}
                                 try { XposedHelpers.callMethod(amapLoc, "setGpsAccuracyStatus", 1) } catch (_: Throwable) {}
-                                try { XposedHelpers.callMethod(amapLoc, "setSatellites", config.optInt("satellite_count", 20)) } catch (_: Throwable) {}
+                                try { XposedHelpers.callMethod(amapLoc, "setSatellites", RouteEngine.realisticSatelliteCounts(config).visible) } catch (_: Throwable) {}
                             }
                         }
                     }
@@ -121,7 +121,7 @@ internal fun LocationHooker.hookAMapSDK(classLoader: ClassLoader) {
                 var result = chain.proceed(chain.args.toTypedArray())
                 val config = readConfig()
                 if (config != null && config.optBoolean("active", false)) {
-                    result = config.optInt("satellite_count", 20)
+                    result = RouteEngine.realisticSatelliteCounts(config).visible
                 }
                 return@hookAllMethods result
             }
@@ -231,7 +231,7 @@ internal fun LocationHooker.hookAMapSDK(classLoader: ClassLoader) {
                                     try { XposedHelpers.callMethod(amapLoc, "setBearing", motion.bearing) } catch (_: Throwable) {}
                                     try { XposedHelpers.callMethod(amapLoc, "setAltitude", RouteEngine.realisticAltitude(config)) } catch (_: Throwable) {}
                                     try { XposedHelpers.callMethod(amapLoc, "setTime", System.currentTimeMillis()) } catch (_: Throwable) {}
-                                    try { XposedHelpers.callMethod(amapLoc, "setSatellites", config.optInt("satellite_count", 20)) } catch (_: Throwable) {}
+                                    try { XposedHelpers.callMethod(amapLoc, "setSatellites", RouteEngine.realisticSatelliteCounts(config).visible) } catch (_: Throwable) {}
                                     try { XposedHelpers.callMethod(amapLoc, "setGpsAccuracyStatus", 1) } catch (_: Throwable) {}
                                     try { XposedHelpers.callMethod(amapLoc, "setLocationType", 1) } catch (_: Throwable) {}
                                     return@hookAllMethods innerChain.proceed(innerChain.args.toTypedArray())
@@ -271,7 +271,7 @@ internal fun LocationHooker.hookAMapSDK(classLoader: ClassLoader) {
                             try { XposedHelpers.setDoubleField(amapLoc, "mLongitude", motion.lng) } catch (_: Throwable) {}
                             try { XposedHelpers.callMethod(amapLoc, "setLocationType", 1) } catch (_: Throwable) {}
                             try { XposedHelpers.callMethod(amapLoc, "setGpsAccuracyStatus", 1) } catch (_: Throwable) {}
-                            try { XposedHelpers.callMethod(amapLoc, "setSatellites", config.optInt("satellite_count", 20)) } catch (_: Throwable) {}
+                            try { XposedHelpers.callMethod(amapLoc, "setSatellites", RouteEngine.realisticSatelliteCounts(config).visible) } catch (_: Throwable) {}
                             try { XposedHelpers.callMethod(amapLoc, "setRadius", getJitteredAccuracy()) } catch (_: Throwable) {}
                             return@hookAllMethods amapLoc
                         }
@@ -306,7 +306,7 @@ internal fun LocationHooker.hookAMapSDK(classLoader: ClassLoader) {
             }
             XposedHelpers.hookAllMethods(reportClazz, "getGPSSatellites") { chain, _ ->
                 val config = readConfig()
-                if (config != null && config.optBoolean("active", false)) config.optInt("satellite_count", 20) else chain.proceed(chain.args.toTypedArray())
+                if (config != null && config.optBoolean("active", false)) RouteEngine.realisticSatelliteCounts(config).visible else chain.proceed(chain.args.toTypedArray())
             }
             XposedHelpers.hookAllMethods(reportClazz, "getGPSStatus") { chain, _ ->
                 val config = readConfig()

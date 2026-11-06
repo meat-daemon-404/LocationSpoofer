@@ -767,11 +767,11 @@ class LocationHooker : XposedModule() {
                                                     )
                                                     try {
                                                         val extras = android.os.Bundle().apply {
-                                                            val satCount = newConfig.optInt("satellite_count", 20)
-                                                            putInt("satellites", satCount)
-                                                            putInt("satellites_in_view", satCount)
-                                                            putInt("satellites_used_in_fix", satCount.coerceAtLeast(12))
-                                                            putInt("satellites_visible", satCount)
+                                                            val satCounts = RouteEngine.realisticSatelliteCounts(newConfig)
+                                                            putInt("satellites", satCounts.usedInFix)
+                                                            putInt("satellites_in_view", satCounts.inView)
+                                                            putInt("satellites_used_in_fix", satCounts.usedInFix)
+                                                            putInt("satellites_visible", satCounts.inView)
                                                             putBoolean("mockLocation", false)
                                                         }
                                                         XposedHelpers.callMethod(mockLoc, "setExtras", extras)
@@ -922,17 +922,17 @@ class LocationHooker : XposedModule() {
                                                         timeNow
                                                     )
                                                     try {
-                                                        XposedHelpers.callMethod(mockAMapLoc, "setSatellites", newConfig.optInt("satellite_count", 20))
+                                                        XposedHelpers.callMethod(mockAMapLoc, "setSatellites", RouteEngine.realisticSatelliteCounts(newConfig).visible)
                                                         XposedHelpers.callMethod(mockAMapLoc, "setGpsAccuracyStatus", 1)
                                                         XposedHelpers.callMethod(mockAMapLoc, "setLocationType", 1)
                                                     } catch (_: Throwable) {}
                                                     try {
                                                         val extras = android.os.Bundle().apply {
-                                                            val satCount = newConfig.optInt("satellite_count", 20)
-                                                            putInt("satellites", satCount)
-                                                            putInt("satellites_in_view", satCount)
-                                                            putInt("satellites_used_in_fix", satCount.coerceAtLeast(12))
-                                                            putInt("satellites_visible", satCount)
+                                                            val satCounts = RouteEngine.realisticSatelliteCounts(newConfig)
+                                                            putInt("satellites", satCounts.usedInFix)
+                                                            putInt("satellites_in_view", satCounts.inView)
+                                                            putInt("satellites_used_in_fix", satCounts.usedInFix)
+                                                            putInt("satellites_visible", satCounts.inView)
                                                             putBoolean("mockLocation", false)
                                                         }
                                                         XposedHelpers.callMethod(mockAMapLoc, "setExtras", extras)
@@ -997,7 +997,7 @@ class LocationHooker : XposedModule() {
                                                     XposedHelpers.callMethod(mockBDLoc, "setSpeed", pushSpeed * 3.6f)
                                                     XposedHelpers.callMethod(mockBDLoc, "setDirection", pushBearing)
                                                     XposedHelpers.callMethod(mockBDLoc, "setLocType", 61)
-                                                    XposedHelpers.callMethod(mockBDLoc, "setSatelliteNumber", 20)
+                                                    XposedHelpers.callMethod(mockBDLoc, "setSatelliteNumber", RouteEngine.realisticSatelliteCounts(newConfig).visible)
                                                     XposedHelpers.callMethod(mockBDLoc, "setGpsCheckStatus", 1)
                                                     try { XposedHelpers.callMethod(mockBDLoc, "setMockGps", 0) } catch (_: Throwable) {}
                                                     try { XposedHelpers.callMethod(mockBDLoc, "setTime", java.text.SimpleDateFormat("yyyy-MM-dd HH:mm:ss", java.util.Locale.US).format(java.util.Date())) } catch (_: Throwable) {}

@@ -88,7 +88,7 @@ internal fun LocationHooker.hookGnssStatus(classLoader: ClassLoader) {
                                 val statusObj = innerChain.args[0]
                                 val config = readConfig()
                                 if (config != null && config.optBoolean("active", false)) {
-                                    val count = config.optInt("satellite_count", 20)
+                                    val count = RouteEngine.realisticSatelliteCounts(config).inView
                                     val enableJitter = config.optBoolean("enable_jitter", true)
                                     val spoofedStatus = GnssFastMockEngine.getOrCreateSpoofedGnssStatus(
                                         classLoader = clazz.classLoader ?: classLoader,
@@ -185,7 +185,7 @@ internal fun LocationHooker.hookGnssStatus(classLoader: ClassLoader) {
                 val result = chain.proceed(chain.args.toTypedArray())
                 val config = readConfig()
                 if (config != null && config.optBoolean("active", false)) {
-                    val count = config.optInt("satellite_count", 20)
+                    val count = RouteEngine.realisticSatelliteCounts(config).inView
                     val statusObj = result ?: chain.args.firstOrNull()
                     if (statusObj != null) {
                         try {
@@ -208,7 +208,7 @@ internal fun LocationHooker.hookGnssStatus(classLoader: ClassLoader) {
             ) { chain, method ->
                 val config = readConfig()
                 if (config != null && config.optBoolean("active", false)) {
-                    val count = config.optInt("satellite_count", 20)
+                    val count = RouteEngine.realisticSatelliteCounts(config).inView
                     return@hookMethod GnssFastMockEngine.getOrCreateSpoofedGpsSatellites(classLoader, count)
                 }
                 return@hookMethod chain.proceed(chain.args.toTypedArray())
@@ -227,7 +227,7 @@ internal fun LocationHooker.hookGnssStatus(classLoader: ClassLoader) {
 
 internal fun LocationHooker.createSpoofedGpsSatellites(classLoader: ClassLoader): Iterable<Any> {
     val config = readConfig()
-    val count = config?.optInt("satellite_count", 20) ?: 20
+    val count = config?.let { RouteEngine.realisticSatelliteCounts(it).inView } ?: 20
     return GnssFastMockEngine.getOrCreateSpoofedGpsSatellites(classLoader, count)
 }
 

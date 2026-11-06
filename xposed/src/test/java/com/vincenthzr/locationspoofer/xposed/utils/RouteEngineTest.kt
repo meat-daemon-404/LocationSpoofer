@@ -179,4 +179,40 @@ class RouteEngineTest {
         val legacy = (0..600 step 10).map { RouteEngine.realisticAltitude(cfg(null), now = 1_000_000L + it * 1000L) }
         assertTrue(legacy.all { it in 77.0..83.0 })
     }
+
+    @Test
+    fun `satellite counts vary over time and stay physically consistent`() {
+        fun cfg(base: Int, start: Long) = JSONObject().apply {
+            put("is_route_mode", false)
+            put("lat", 31.5)
+            put("lng", 120.5)
+            put("satellite_count", base)
+            put("start_timestamp", start)
+        }
+
+        // 一场跑下来不该每分钟都报同一个数
+        val samples = (0..3600 step 5).map {
+            RouteEngine.realisticSatelliteCounts(cfg(20, 1_000_000L), now = 1_000_000L + it * 1000L)
+        }
+        assertTrue(samples.map { it.visible }.toSet().size >= 2)
+
+        // 任何时刻都满足 参与解算 <= 可见 <= 视野内，而且都落在合法区间
+        samples.forEach { counts ->
+            assertTrue(counts.usedInFix in 4..counts.visible)
+            assertTrue(counts.visible in 8..32)
+            assertTrue(counts.inView >= counts.visible)
+            assertTrue(counts.inView <= 32)
+        }
+
+        // 基准颗数仍然起作用：基准 10 与 28 的可见颗数要拉开
+        val low = RouteEngine.realisticSatelliteCounts(cfg(10, 1_000_000L), now = 1_500_000L).visible
+        val high = RouteEngine.realisticSatelliteCounts(cfg(28, 1_000_000L), now = 1_500_000L).visible
+        assertTrue(high - low >= 12)
+
+        // 不同场次（不同起始时刻）不该全员报同一组数字
+        val perRun = (0 until 12L)
+            .map { RouteEngine.realisticSatelliteCounts(cfg(20, 1_000_000L + it * 37 * 60_000L), now = 1_700_000L).visible }
+            .toSet()
+        assertTrue(perRun.size >= 3)
+    }
 }

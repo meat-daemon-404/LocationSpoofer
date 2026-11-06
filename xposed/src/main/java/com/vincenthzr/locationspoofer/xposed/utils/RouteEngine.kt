@@ -5,6 +5,7 @@ import com.vincenthzr.locationspoofer.utils.CoordinateUtils.LatLng
 import com.vincenthzr.locationspoofer.utils.GeoMath
 import com.vincenthzr.locationspoofer.utils.MotionRealism
 import com.vincenthzr.locationspoofer.utils.RoutePath
+import com.vincenthzr.locationspoofer.utils.SatelliteModel
 import org.json.JSONArray
 import org.json.JSONObject
 
@@ -103,6 +104,21 @@ object RouteEngine {
         val pos = calculateCurrentPosition(config, now)
         return AltitudeModel.altitude(base, variation, drift, pos.lat, pos.lng, now)
     }
+
+    /**
+     * 当前时刻的卫星数：配置的基准颗数 + 随时间缓慢起伏的分布（见 [SatelliteModel]），
+     * 各进程对同一时刻给出一致的值。
+     *
+     * 各通道口径不同，别混用：`satellites` / `satellites_used_in_fix` 是**参与解算**的颗数，
+     * `satellites_in_view` / `satellites_visible` 与 GnssStatus 报的是**在视野内**的颗数。
+     * 旧实现让所有通道都用同一个常量，还出现过"参与解算 12 颗 > 可见 10 颗"这种物理上不可能的组合。
+     */
+    fun realisticSatelliteCounts(config: JSONObject, now: Long = System.currentTimeMillis()): SatelliteModel.Counts =
+        SatelliteModel.counts(
+            baseCount = config.optInt("satellite_count", 20),
+            seed = config.optLong("start_timestamp", 0L),
+            epochMs = now
+        )
 
     /** 配置里缺少真实度字段（旧版 App 写的配置）时按"关闭 + 不浮动"处理，行为与旧版一致 */
     fun realismSession(config: JSONObject, startTimestamp: Long = config.optLong("start_timestamp", 0L)): MotionRealism.Session =

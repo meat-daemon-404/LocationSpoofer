@@ -142,7 +142,7 @@ internal fun LocationHooker.spoofNmeaMessage(sentence: String): String? {
             fields[4] = lngStr
             fields[5] = lngDir
             if (fields.size > 6) fields[6] = "1" // GPS Fix (Quality indicator)
-            if (fields.size > 7) fields[7] = config.optInt("satellite_count", 18).toString() // Number of satellites
+            if (fields.size > 7) fields[7] = RouteEngine.realisticSatelliteCounts(config).usedInFix.toString() // Number of satellites
             if (fields.size > 8) fields[8] = "0.8" // HDOP (High accuracy)
             if (fields.size > 9) fields[9] = String.format(java.util.Locale.US, "%.1f", RouteEngine.realisticAltitude(config))
             modified = true

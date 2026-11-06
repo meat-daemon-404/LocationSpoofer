@@ -9,8 +9,9 @@
 
 一句话结论：**抓到的从来不是 `isFromMockProvider`，而是同一个物理量在不同通道上对不上。**
 
-> 落地状态：§1、§2、§3、§4.1、§4.2、§4.3、§5、§6 已全部实现，全量编译通过，
-> `core-geo` 单元测试 36 项 + `xposed` 14 项全绿；另有 §4.4 两条已知边界未改（需要产品决策）。
+> 落地状态：§1、§2、§3、§4.1、§4.2、§4.3、§4.5、§5、§6 已全部实现，全量编译通过，
+> `core-geo` 单元测试 41 项 + `xposed` 15 项全绿；另有 §4.4 两条已知边界与 §4.5 末段的
+> 卫星 ID 集合未改（前者需要产品决策，后者是下一个抓手）。
 > 验证边界见文末「本次改动的验证边界」。
 
 ---
@@ -156,7 +157,7 @@ private fun bearingAlong(along: Double, forward: Boolean): Float {
 
 ---
 
-## 4. 海拔与计步初值：常量是最廉价的特征
+## 4. 常量是最廉价的特征：海拔、计步初值、卫星数
 
 ### 4.1 海拔会退化成常量（已实施：只改漂移幅度下限，档位语义不动）
 
@@ -247,6 +248,54 @@ private val bootStepsBase: Double = 2350.0 + noiseRng.nextInt(2400).toDouble()
 配置坐标当输出），所以站着不动时位置是**精确等于**配置坐标的。对定位 App 来说这没问题，
 但如果目标 App 用加速度计/陀螺仪做"静止判定 + 位置应保持不变"的一致性检查，精确相等反而
 是异常的——真机静止时位置还有亚米级漂移。这一条没有改动，只是已知边界。
+
+### 4.5 卫星数是跨通道对不上的常量（已实施）
+
+原状：卫星数在所有通道里都读同一个配置项 `config.optInt("satellite_count", 20)`，共 11 处；
+`BaiduMapHooker` 的三处 `setSatelliteNumber` 干脆硬编码 `20`，连配置都不看；
+`NmeaSpoofing` 的缺省值是 `18`，与其余通道的 `20` 不一致。
+
+更要紧的是**口径混用**。`Location.extras` 与 NMEA GGA 里这两个数不是一回事：
+
+| 字段 | 语义 |
+|---|---|
+| `satellites` / `satellites_used_in_fix` / GGA 第 7 字段 | **参与解算**的颗数 |
+| `satellites_in_view` / `satellites_visible` / GnssStatus 上报的星座 | **在视野内**的颗数 |
+
+原实现把两者都写成同一个常量，还用 `satCount.coerceAtLeast(12)` 去抬 `used_in_fix`。
+而 App 端 `satellite_count` 的默认值是 `"10"`（`SettingsManager.kt:171`），于是默认配置下：
+
+| 通道 | 改前取值 |
+|---|---|
+| `satellites` / `satellites_in_view` / `satellites_visible` | 10（常量） |
+| `satellites_used_in_fix` | 12（被 `coerceAtLeast(12)` 抬上去） |
+
+**参与解算 12 颗 > 可见 10 颗**，物理上不可能；而且一场跑下来 100% 不变，跨账号完全一致。
+
+改法：`core-geo` 新增 `SatelliteModel`，输入只有三个纯量（基准颗数、种子 = `start_timestamp`、
+绝对时刻），输出 `Counts(visible, inView, usedInFix)`，构造上恒满足 `usedInFix ≤ visible ≤ inView`：
+
+* `visible = 基准 + 3 · noise(t)`，截断 8–32；
+* `usedInFix = visible − drop`，`drop ∈ [2, 6]` 由另一路 noise 决定；
+* `inView = visible + extra`，`extra ∈ [0, 3]`。
+
+`xposed` 侧只留一个出口 `RouteEngine.realisticSatelliteCounts(config, now)`，11 处调用点全部
+改为按通道语义取值，不再各自解析配置。
+
+实测（1 小时 @1 Hz，改后）：
+
+| 基准 | visible | usedInFix | inView | 违反包含关系 |
+|---|---|---|---|---|
+| 10 | 8–12（5 种取值） | 4–9 | 8–14 | 0 |
+| 20 | 17–22（6 种取值） | 12–19 | 18–24 | 0 |
+| 28 | 25–30（6 种取值） | 20–27 | 26–32 | 0 |
+
+20 个不同场次（不同 `start_timestamp`）在同一时刻报出的 `visible` 落在 18–22、共 5 种取值。
+幅度不大是正常的——真实卫星数本来就窄幅波动，这里要解决的是"不再是同一个数"。
+
+仍未做：`GnssFastMockEngine` 的 `SVID_LIST` 是固定前缀常量（BDS 1-35 / GPS 1-32 / GLONASS 1-24 /
+Galileo 1-36），**每个用户看到的卫星 ID 集合完全相同**；每颗卫星的仰角/方位漂移用的是进程内
+计数器，重启归零。这是下一个同类抓手。
 
 ---
 
@@ -362,6 +411,8 @@ nextDispatchMs += dispatchPeriodMs
 | P1 | 精度分布集中在一个窄区间 | `getJitteredAccuracy()` | 长期分布不被截断在 3.5 m 以内 | 已实施 |
 | P2 | 派发钉绝对时间网格 | `LocationHooker.kt:663` | 派发间隔抖动 < 5 ms | 已实施（仅逻辑，未上真机） |
 | P2 | 精度基准随区域/时段慢变 | `getJitteredAccuracy()` | 慢变分量周期在分钟级 | 已实施（简单版） |
+| P1 | 卫星数是跨通道对不上的常量 | `SatelliteModel` + `RouteEngine.realisticSatelliteCounts()` | `used_in_fix ≤ visible ≤ in_view` 恒成立；1 小时内取值不止一种 | 已实施 |
+| P2 | 卫星 ID 集合全员相同 | `GnssFastMockEngine.SVID_LIST` | 不同会话的 SVID 集合不相等 | 未改（见 §4.5 末段） |
 | P2 | 基准海拔缺省 0 导致全员海平面 | `SettingsManager.kt:129` / `LocationRepository` | 不出现跨账号的同一基准值 | 未改（需产品决策，见 §4.4） |
 | P2 | 静止时位置精确等于配置坐标 | `LocationHooker` `isStationary` 分支 | 静止时仍有亚米级漂移 | 未改（见 §4.4） |
 
@@ -369,25 +420,29 @@ nextDispatchMs += dispatchPeriodMs
 
 ## 11. 本次改动的验证边界
 
-本仓库这一轮改了 9 项（§4.1、§4.2、§4.3、§1、§2、§3、§5、§6、计步初值），
-**都没有打 APK、没有上真机**。按验证强度分四类：
+本仓库这一轮改了 10 项（§1、§2、§3、§4.1、§4.2、§4.3、§4.5、§5、§6、计步初值），
+**都没有打 APK、没有上真机**。按验证强度分五类：
 
 
 **① 全量编译（`core-geo` + `xposed`）**
 
-- 用 `kotlin-compiler-embeddable 2.0.0` 直接以命令行编译两个模块的全部 67 个 Kotlin 源文件
-  （classpath = `android-34/android.jar` + libxposed API jar），产出 358 个 class，
-  **退出码 0、无错误**。
+- 用 `kotlin-compiler-embeddable 2.0.0` 直接以命令行编译两个模块的全部 68 个 Kotlin 源文件
+  加 1 份 `BuildConfig` 桩（classpath = `android-34/android.jar` + libxposed API jar），
+  产出 362 个 class，**退出码 0、无错误**。
 - `core-geo` 用到的 `BuildConfig` 需要一份桩（真 BuildConfig 由 flavor 生成），
   桩只要 `const val GLOBAL_SCHEME: Boolean`。
+- `app-ui` / `core-data` / `service` 三个模块的 Compose、高德/百度 Maps 依赖在本机拿不到，
+  没有本地编译；它们的编译由仓库的 `build` 工作流在 CI 上兜（`assembleScopedDebug`）。
 
-**② 单元测试（`core-geo` 7 个测试类、36 项 + `xposed` 14 项）**
+**② 单元测试（`core-geo` 8 个测试类、41 项 + `xposed` 15 项）**
 
 - 同样绕开 Gradle：编译 `core-geo/src/test` + JUnit 4.13.2 + hamcrest-core 1.3，
-  用 `org.junit.runner.JUnitCore` 直接跑 → **OK (36 tests)**。
-- `xposed` 侧同样方式跑 `RouteEngineTest` → **OK (10 tests)**，其中包含两条既有断言：
+  用 `org.junit.runner.JUnitCore` 直接跑 → **OK (41 tests)**。
+- `xposed` 侧同样方式跑 `RouteEngineTest` → **OK (11 tests)**，其中包含两条既有断言：
   显式 `altitude_variation_m = 0` 时海拔恒为基准值（`assertEquals(80.0, …, 0.0)`），
   以及老配置（不写该键）落在 `base ± drift` 区间内。这两条是 §4.1 改动的回归护栏。
+- §4.5 的卫星数在两侧都有护栏：`SatelliteModelTest` 5 项（区间、包含关系、时间起伏、
+  同刻一致、跨场次分散），`RouteEngineTest` 里 1 项从配置 JSON 走完整条链路断言同一组关系。
 - 其中 `RoutePathTest` 覆盖开环折返、闭环前进、到站停留与 `GeoMath` 一致性，
   bearing 平滑改动后全部仍通过（关键：位置与朝向在直段上逐位不变）。
 
@@ -406,6 +461,14 @@ nextDispatchMs += dispatchPeriodMs
   显式 `altitude_variation_m = 0` 仍完全固定——说明改动只作用在"原本完全不动"的那部分。
 - 精度：同一 OU + 慢变噪声模型各跑 3600 点，得到 §5 的分布。改前 100% 落在 1.5–3.5 m，
   改后落在该区间的只剩 1.6%。
+
+**⑤ 数值对照（卫星数，1 小时 @1 Hz × 三个基准值）**
+
+- 三种基准（10 / 20 / 28）各采样 3600 点，`used_in_fix ≤ visible ≤ in_view` 的违反次数
+  都是 0；`visible` 分别有 5 / 6 / 6 种不同取值，而改前是一个常量。
+- 20 个不同 `start_timestamp` 在同一时刻的 `visible` 落在 18–22，共 5 种取值。
+- 这一节只证明"模型本身不自相矛盾且不是常量"，**不能证明真机上目标 App 读到的就是这个数**——
+  那要等上真机抓包（附录第 4 条）。
 
 **仍然不能确定的是真机运行时行为**：反射构造 `SensorEvent` 的三条 fallback 路径、
 不同 ROM 下 `TYPE_STEP_DETECTOR` 的实际投递节奏、`Thread.sleep` 网格在真机上的实际抖动
@@ -427,3 +490,6 @@ nextDispatchMs += dispatchPeriodMs
    出现接近折点转角的孤立大值即为未平滑。
 5. **派发抖动**：记录连续派发时刻，`maxGap - minGap` 应小于 10 ms。
 6. **计步初值**：杀进程重进两次，比较首次 `STEP_COUNTER` 读数，不应相等。
+7. **卫星数三口径**：同一时刻断言 `satellites_used_in_fix ≤ satellites ≤ satellites_in_view`，
+   且连续 1 小时采样取值不止一种；默认配置（`satellite_count` 缺省 `10`）下尤其要确认
+   `used_in_fix` 没有超过 `visible`。

@@ -251,12 +251,12 @@ internal class ColorOs16LocationDelivery(
     }
 
     private fun applySatelliteExtras(location: Location, config: JSONObject) {
-        val satellites = config.optInt("satellite_count", 20).coerceIn(4, 32)
+        val counts = RouteEngine.realisticSatelliteCounts(config)
         location.extras = android.os.Bundle(location.extras ?: android.os.Bundle()).apply {
-            putInt("satellites", satellites)
-            putInt("satellites_in_view", satellites)
-            putInt("satellites_visible", satellites)
-            putInt("satellites_used_in_fix", satellites.coerceAtMost(12))
+            putInt("satellites", counts.usedInFix)
+            putInt("satellites_in_view", counts.inView)
+            putInt("satellites_visible", counts.inView)
+            putInt("satellites_used_in_fix", counts.usedInFix)
         }
     }
 

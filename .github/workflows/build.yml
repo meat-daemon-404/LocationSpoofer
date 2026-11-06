@@ -22,6 +22,8 @@ concurrency:
 jobs:
   build:
     runs-on: ubuntu-latest
+    # 卡住时要失败，而不是无限期挂着（曾出现过构建步骤挂 20 分钟以上）
+    timeout-minutes: 25
     steps:
       - name: Checkout Code
         uses: actions/checkout@v4
@@ -45,3 +47,13 @@ jobs:
         if: always()
         run: |
           find app/build/outputs/apk -name '*.apk' -printf '%p  %s bytes\n' || true
+
+      # 上传 debug 包：不签名、不发版，但任何人都能下载它做真机验证。
+      - name: Upload debug APK
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: debug-apk
+          path: app/build/outputs/apk/**/*.apk
+          if-no-files-found: warn
+          retention-days: 7

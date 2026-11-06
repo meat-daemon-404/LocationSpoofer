@@ -20,6 +20,8 @@ concurrency:
 jobs:
   build-and-release:
     runs-on: ubuntu-latest
+    # 卡住时要失败，而不是无限期挂着（曾出现过构建步骤挂 20 分钟以上）
+    timeout-minutes: 30
     steps:
       - name: Checkout Code
         uses: actions/checkout@v4
@@ -48,8 +50,8 @@ jobs:
           chmod +x ./gradlew
           # 两种模拟方案分开打包：同一次调用里并行打包多个变体 × ABI 拆分时，
           # AGP 的签名摘要任务会和打包写文件任务抢 ForkJoinPool 而互相死锁。
-          ./gradlew --no-daemon :app:assembleScopedDebug
-          ./gradlew --no-daemon :app:assembleGlobalDebug
+          ./gradlew --no-daemon --stacktrace :app:assembleScopedDebug
+          ./gradlew --no-daemon --stacktrace :app:assembleGlobalDebug
 
       - name: Collect and rename APKs
         run: |

@@ -1,4 +1,4 @@
-﻿# 适配进度
+# 适配进度
 
 本文件记录各系统 / 机型在两个模拟方案下的**实机验证**情况，是"现在到底适配到哪了"的唯一出处。
 只登记在真机上实际测过的结果，没测过的一律写"未验证"，不要凭推测填写。
@@ -68,6 +68,18 @@
 | 小米 Mi 10 Pro | Android 15 | SukiSU + LSPosed (API 101+) | 高德定位 SDK 回调（`com.bxkj.student` 跑步流程），见 PR #69 | ✅ |
 
 > 非全局方案是项目的原有方案，历史上验证过的机型尚未整理进来，欢迎补充。
+
+### 模拟器（scoped，Android 15 x86_64）
+
+不是真机，单独列出来是因为这里的验证深度高于上面的真机记录，且可完整复现。
+
+| 环境 | 系统 / 框架 | 版本 | 验证内容 | 状态 |
+|---|---|---|---|---|
+| MuMu 模拟器实例（x86_64，ARM 转译） | Android 15 / LSPosed 2.2.1 (7912) / API 102 | 3.0.21-beta-3（debug 签名，arm64-v8a） | 模块注入目标进程（`[INJECTED] Hooking package`）、反检测 Hook 组、GnssStatus Hook、Wi-Fi 环境 Hook 全部安装；`addNmeaListener` 的监听器被成功替换为内置 proxy（`[GPS_Spoofer] ... Starting active injector` ×2）；**坐标端到端**：只改配置里的经纬度（`30.274085,120.15507` → `18.254925,109.512026`），目标应用（高德地图）首页城市与天气随之由「杭州市」变为「三亚市」 | ✅ |
+| 同上 | 同上 | 同上 | 卫星颗数 / 海拔 / 气压 / NMEA 的应用侧读数：取不到（模拟器上 KernelSU 没有 `su`，应用过不了自己的 root 门禁，只能用 DEBUG 构建的兜底配置源驱动），只有派发侧日志证据 | ❔ |
+
+> 这一栏的详细过程（含两个只在真机暴露的 `Chain.args` 不可变问题）见
+> [docs/anti-detection-empirical.md](docs/anti-detection-empirical.md) 第 12 节。
 
 ---
 

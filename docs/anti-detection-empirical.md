@@ -9,9 +9,9 @@
 
 一句话结论：**抓到的从来不是 `isFromMockProvider`，而是同一个物理量在不同通道上对不上。**
 
-> 落地状态：§1、§2、§3、§4.1、§4.2、§4.3、§4.5、§4.6、§4.7、§4.8、§4.9、§4.10、§4.11、§4.12、§4.13、§4.14、§5、§6 已全部实现，
-> 全量编译通过，`core-geo` 单元测试 99 项 + `xposed` 29 项全绿；另有 §4.4 两条已知边界未改
-> （基准海拔缺省值与静止位置精确，都需要产品决策）。
+> 落地状态：§1、§2、§3、§4.1、§4.2、§4.3、§4.5、§4.6、§4.7、§4.8、§4.9、§4.10、§4.11、§4.12、§4.13、§4.14、§4.15、§5、§6 已全部实现，
+> 全量编译通过，`core-geo` 单元测试 106 项 + `xposed` 31 项全绿；只剩 §4.4 的一条已知边界未改
+> （基准海拔缺省值，需要产品决策）。
 > **已上机验证**（Android 15 x86_64 模拟器，LSPosed 注入目标进程、十五项改动在设备上被真实求值），
 > 过程中抓到并修掉两个只在真机暴露的 `Chain.args` 不可变问题，详见 §12；仍未走通的是「有 root 的端到端链路」。
 > 验证边界见文末「本次改动的验证边界」。
@@ -886,6 +886,53 @@ DRIFT t=0..3000s: -21.324/20.850/-35.172 → -21.028/21.126/-33.977
 
 ---
 
+## 4.15 静止位置逐位相同（已实施）
+
+### 原状
+
+- 非路线模式下 `calculateCurrentPosition()` 直接返回配置里的 `lat/lng`
+  （`RouteEngine.kt` 的 `SpoofedMotion(base.lat, base.lng, baseBearing, 0f)`）。
+- 目标 App 连续取十分钟位置，拿到的是**完全一样的一串数字**；而真机静止时坐标仍在
+  亚米到数米之间漂。
+- 摇杆松开（`speed = 0`）、路线点数不足、路线非法这三条回落路径同样返回固定坐标。
+- 这条曾是 §4.4 并列的两条边界之一；它不需要产品决策，只是没人做。
+
+### 改法
+
+新增 `core-geo/.../PositionJitter.kt`：
+
+| 项 | 做法 |
+|---|---|
+| 幅度 | 半径上限 `MAX_RADIUS_M = 2.2 m`，量化步长 `RESOLUTION_M = 0.05 m` |
+| 形状 | 东 / 北各一条 `SmoothNoise`（周期 24~150 s 与 31~190 s），夹进半径上限 |
+| 一致性 | 纯函数 `offsetMeters(seed, elapsedSec)`：同一时刻各进程算出同一个偏移 |
+| 换算 | 偏移 → 方位角 `atan2(东, 北)` + 距离，走 `GeoMath.destination()` 落回经纬度 |
+
+`RouteEngine` 新增 `stationaryMotion(config, now, base, bearing)`，替换三处回落分支；
+`stationary_jitter = false` 可关掉（用于必须钉死坐标的场景）。
+
+### 实测（30 分钟 @1 Hz，纯函数）
+
+```
+STAT maxRadius=2.17 minRadius=0.05 distinct=1417 maxStepPerSec=0.49 nearZero=0/1801
+ROUNDTRIP worstMeters=0.0000
+SESSIONS distinct=20
+SAMPLE t=0    east=0.75  north=-1.35 r=1.54
+SAMPLE t=60   east=-0.85 north=-1.25 r=1.51
+SAMPLE t=600  east=-0.60 north=-0.50 r=0.78
+SAMPLE t=1800 east=-0.45 north=-0.45 r=0.64
+```
+
+30 分钟里出现 **1417 个不同坐标**，没有一次落回"半径 0"；相邻秒最大位移 0.49 m，
+远小于定位精度；偏移量换成经纬度再量回来误差 0。
+
+### 诚实边界
+
+- 抖动是"像真机的量级"，不是标定过的接收机噪声模型：没有做与卫星几何相关的误差椭圆，
+  也没跟 `getAccuracy()` 联动（精度 4~9 m、抖动 2 m 上下，量级上说得通）。
+- 只加在静止路径上；路线模式本来就在动。
+- 半径上限 2.2 m 意味着“钉住某个坐标”时用户会看到位置缓慢绕圈，这是有意的取舍。
+
 ## 5. 精度：原范围偏乐观（已实施：放宽基准，加慢变分量）
 
 原 `getJitteredAccuracy()` 用 OU 式游走 `(2.2 + drift).coerceIn(1.5, 3.5)`，恒定有起伏，
@@ -1011,16 +1058,16 @@ nextDispatchMs += dispatchPeriodMs
 | P1 | 未校准三通道仍是真机读数，与改写后的校准通道减不出同一个值 | `SensorBiasModel` + `SensorStepHooker` | 未校准前三位减后三位逐位等于校准通道；零偏量级在真机器件区间内且随时间慢漂 | 已实施 |
 | P1 | 磁力计与旋转矢量仍是真机姿态，与改写后的重力/航向互相否定 | `GeomagneticModel` / `AttitudeModel` + `SensorStepHooker` | `rotateToDevice(q, 世界重力) == gravity`、磁力计反解航向 = 路线航向、`\|B\|` 不随航向变 | 已实施 |
 | P2 | 基准海拔缺省 0 导致全员海平面 | `SettingsManager.kt:129` / `LocationRepository` | 不出现跨账号的同一基准值 | 未改（需产品决策，见 §4.4） |
-| P2 | 静止时位置精确等于配置坐标 | `LocationHooker` `isStationary` 分支 | 静止时仍有亚米级漂移 | 未改（见 §4.4） |
+| P2 | 静止时位置逐位等于配置坐标 | `PositionJitter` + `RouteEngine.stationaryMotion()` | 静止 30 分钟内坐标取值不止一种、偏移半径 ≤ 2.2 m | 已实施 |
 
 ---
 
 ## 11. 本次改动的验证边界
 
-本仓库这一轮改了 20 项（§1、§2、§3、§4.1、§4.2、§4.3、§4.5 卫星数与天空几何、§4.6 气压计、
+本仓库这一轮改了 21 项（§1、§2、§3、§4.1、§4.2、§4.3、§4.5 卫星数与天空几何、§4.6 气压计、
 §4.7 MSL 海拔与垂直精度、§4.8 首个 fix 耗时、§4.9 NMEA 的 GSV/GSA、§4.10 陀螺仪、
 §4.11 步事件时刻、§4.12 重力与线性加速度、§4.13 磁力计与旋转矢量、§4.14 未校准三通道、
-§5、§6、计步初值）。
+§4.15 静止位置抖动、§5、§6、计步初值）。
 这批改动里有**一次真正的上机运行**（§12：APK 装进 Android 15 模拟器、Xposed 注入目标进程成功），
 并且做到了**坐标这一项的端到端对照**（改配置即换城市，§12.6）；
 **运动学通道（加速度计 / 重力 / 线性加速度 / 陀螺仪）在路线模式跑动中读数自洽**（§12.6b：
@@ -1031,15 +1078,15 @@ nextDispatchMs += dispatchPeriodMs
 
 **① 全量编译（`core-geo` + `xposed`）**
 
-- 用 `kotlin-compiler-embeddable 2.0.0` 直接以命令行编译两个模块的全部 78 个 Kotlin 源文件
+- 用 `kotlin-compiler-embeddable 2.0.0` 直接以命令行编译两个模块的全部 79 个 Kotlin 源文件
   加 1 份 `BuildConfig` 桩（classpath = `android-34/android.jar` + libxposed API jar），
-  产出 384 个 class，**退出码 0、无错误**。
+  产出 386 个 class，**退出码 0、无错误**。
 - `core-geo` 用到的 `BuildConfig` 需要一份桩（真 BuildConfig 由 flavor 生成），
   桩只要 `const val GLOBAL_SCHEME: Boolean`。
 - `app-ui` / `core-data` / `service` 三个模块的 Compose、高德/百度 Maps 依赖在本机拿不到，
   没有本地编译；它们的编译由仓库的 `build` 工作流在 CI 上兜（`assembleScopedDebug`）。
 
-**② 单元测试（`core-geo` 15 个测试类、99 项 + `xposed` 5 个测试类、29 项）**
+**② 单元测试（`core-geo` 16 个测试类、106 项 + `xposed` 5 个测试类、31 项）**
 
 - 同样绕开 Gradle：编译 `core-geo/src/test` + JUnit 4.13.2 + hamcrest-core 1.3，
   用 `org.junit.runner.JUnitCore` 直接跑 → **OK (99 tests)**。
@@ -1150,6 +1197,8 @@ nextDispatchMs += dispatchPeriodMs
 - 步事件时刻：恒定 168 spm、60 秒、1 Hz 派发下，新实现 168 步、相邻间隔 349–364 ms（极差 **15 ms**），
   原实现同样 168 步但间隔 285–642 ms（极差 **357 ms**），理论值 357.1 ms。
   原实现前 12 个间隔呈 `357, 285, 357, 357, 285, 357 …` 的三拍子，即跨派发边界的接缝。
+- 静止位置抖动：30 分钟 @1 Hz 共 1801 个点里出现 **1417 个不同坐标**（原实现只有 1 个）；
+  半径最大 2.17 m、最小 0.05 m，相邻秒最大位移 0.49 m，20 个场次同刻偏移互不相同。
 
 **⑩ 上机（模拟器：模块注入 + DEBUG 兜底 + 派发侧日志，详见 §12）**
 

@@ -1,6 +1,9 @@
 package com.vincenthzr.locationspoofer.xposed.utils
 
 import com.vincenthzr.locationspoofer.utils.BarometerModel
+import com.vincenthzr.locationspoofer.utils.CoordinateUtils.LatLng
+import com.vincenthzr.locationspoofer.utils.GeoMath
+import com.vincenthzr.locationspoofer.utils.PositionJitter
 import org.json.JSONArray
 import org.json.JSONObject
 import org.junit.Assert.assertEquals
@@ -29,8 +32,9 @@ class RouteEngineTest {
             put("sim_bearing", 88.0)
         }
         val motion = RouteEngine.calculateCurrentPosition(config, now = 0L)
-        assertEquals(31.5, motion.lat, 0.0)
-        assertEquals(120.5, motion.lng, 0.0)
+        // 静止坐标不再是"逐位等于配置值"：真实 GPS 停着也会在几米内漂（见 PositionJitter），
+        // 这里只要求落在抖动半径内，且速度仍为 0。
+        assertTrue(GeoMath.distance(LatLng(31.5, 120.5), LatLng(motion.lat, motion.lng)) <= PositionJitter.MAX_RADIUS_M)
         assertEquals(88f, motion.bearing)
         assertEquals(0f, motion.speed)
     }
@@ -44,8 +48,7 @@ class RouteEngineTest {
             put("lng", 120.5)
         }
         val motion = RouteEngine.calculateCurrentPosition(config, now = 0L)
-        assertEquals(31.5, motion.lat, 0.0)
-        assertEquals(120.5, motion.lng, 0.0)
+        assertTrue(GeoMath.distance(LatLng(31.5, 120.5), LatLng(motion.lat, motion.lng)) <= PositionJitter.MAX_RADIUS_M)
     }
 
     @Test
@@ -132,11 +135,37 @@ class RouteEngineTest {
     }
 
     @Test
-    fun `released joystick stays at the written coordinate`() {
+    fun `released joystick stays around the written coordinate`() {
         val motion = RouteEngine.calculateCurrentPosition(joystickConfig(0.0, 45.0, 1_000L), now = 5_000L)
+        assertTrue(GeoMath.distance(LatLng(31.5, 120.5), LatLng(motion.lat, motion.lng)) <= PositionJitter.MAX_RADIUS_M)
+        assertEquals(0f, motion.speed)
+    }
+
+    @Test
+    fun `stationary jitter can be switched off to pin the exact coordinate`() {
+        val config = JSONObject().apply {
+            put("is_route_mode", false)
+            put("lat", 31.5)
+            put("lng", 120.5)
+            put("sim_bearing", 88.0)
+            put("stationary_jitter", false)
+        }
+        val motion = RouteEngine.calculateCurrentPosition(config, now = 0L)
         assertEquals(31.5, motion.lat, 0.0)
         assertEquals(120.5, motion.lng, 0.0)
-        assertEquals(0f, motion.speed)
+    }
+
+    @Test
+    fun `stationary positions are not bit identical across two samples`() {
+        val config = JSONObject().apply {
+            put("is_route_mode", false)
+            put("lat", 31.5)
+            put("lng", 120.5)
+            put("start_timestamp", 1_700_000_000_000L)
+        }
+        val first = RouteEngine.calculateCurrentPosition(config, now = 1_700_000_000_000L)
+        val second = RouteEngine.calculateCurrentPosition(config, now = 1_700_000_090_000L)
+        assertTrue(first.lat != second.lat || first.lng != second.lng)
     }
 
     @Test

@@ -5,6 +5,7 @@ import com.vincenthzr.locationspoofer.utils.BarometerModel
 import com.vincenthzr.locationspoofer.utils.CoordinateUtils.LatLng
 import com.vincenthzr.locationspoofer.utils.GeoMath
 import com.vincenthzr.locationspoofer.utils.MotionRealism
+import com.vincenthzr.locationspoofer.utils.PositionJitter
 import com.vincenthzr.locationspoofer.utils.RoutePath
 import com.vincenthzr.locationspoofer.utils.SatelliteModel
 import org.json.JSONArray
@@ -64,13 +65,14 @@ object RouteEngine {
 
         if (!config.optBoolean("is_route_mode", false) || routeArray == null || routeArray.length() < 2) {
             if (config.optString("sim_mode") == "JOYSTICK") {
-                return extrapolateJoystick(config, now, base, baseBearing)
+                val joystick = extrapolateJoystick(config, now, base, baseBearing)
+                return if (joystick.speed > 0f) joystick else stationaryMotion(config, now, base, baseBearing)
             }
-            return SpoofedMotion(base.lat, base.lng, baseBearing, 0f)
+            return stationaryMotion(config, now, base, baseBearing)
         }
 
         val path = routePath(routeArray)
-        if (!path.isValid) return SpoofedMotion(base.lat, base.lng, baseBearing, 0f)
+        if (!path.isValid) return stationaryMotion(config, now, base, baseBearing)
 
         val speed = config.optDouble("speed_m_s", 3.0).coerceAtLeast(0.1)
         val rawStartTime = config.optLong("start_timestamp", 0L)
@@ -84,6 +86,28 @@ object RouteEngine {
         val pos = path.positionAt(traveled, config.optBoolean("stop_at_destination", false))
         val currentSpeed = if (pos.arrived) 0f else realism.speed(speed, elapsedSec).toFloat()
         return SpoofedMotion(pos.lat, pos.lng, pos.bearing, currentSpeed)
+    }
+
+    /**
+     * 静止时也不能一动不动：真机停着的时候坐标仍在几米内来回晃（见 [PositionJitter]），
+     * 而原实现直接返回配置里的固定坐标，连续取十分钟都逐位相同 —— 这是最容易被挑出来的恒定值。
+     *
+     * 抖动幅度远小于定位精度，不影响"人停在原地"的语义；`stationary_jitter = false` 可关掉
+     * （用于需要绝对钉住某个坐标的场景）。
+     */
+    private fun stationaryMotion(config: JSONObject, now: Long, base: LatLng, bearing: Float): SpoofedMotion {
+        if (!config.optBoolean("stationary_jitter", true)) {
+            return SpoofedMotion(base.lat, base.lng, bearing, 0f)
+        }
+        val seed = config.optLong("start_timestamp", 0L)
+        val elapsedSec = if (seed > 0L) (now - seed).coerceAtLeast(0L) / 1000.0 else 0.0
+        val offset = PositionJitter.offsetMeters(seed, elapsedSec)
+        val radius = PositionJitter.radiusMeters(offset)
+        if (radius <= 0.0) return SpoofedMotion(base.lat, base.lng, bearing, 0f)
+        // 偏移以"东 = 东、北 = 北"给出：方位角从正北顺时针量，所以 atan2(东, 北)
+        val headingDeg = Math.toDegrees(kotlin.math.atan2(offset[0].toDouble(), offset[1].toDouble()))
+        val moved = GeoMath.destination(base, headingDeg, radius)
+        return SpoofedMotion(moved.lat, moved.lng, bearing, 0f)
     }
 
     /**

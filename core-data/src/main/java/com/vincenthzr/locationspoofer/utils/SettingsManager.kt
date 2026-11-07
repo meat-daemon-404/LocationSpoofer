@@ -126,8 +126,10 @@ class SettingsManager(context: Context) {
         get() = prefs.getBoolean("restart_apps_on_spoof", true)
         set(value) = prefs.edit().putBoolean("restart_apps_on_spoof", value).apply()
 
+    // 缺省留空表示"按坐标自动估一个地形高度"（见 TerrainElevationModel）：
+    // 旧版缺省 "0.0" 会让所有没配过海拔的用户都停在海平面，是一个跨账号相同的常量。
     var altitude: String
-        get() = prefs.getString("altitude", "0.0") ?: "0.0"
+        get() = prefs.getString("altitude", "") ?: ""
         set(value) = prefs.edit().putString("altitude", value).apply()
 
     /** 海拔相对基准值的最大起伏（±米），0 表示固定海拔 */

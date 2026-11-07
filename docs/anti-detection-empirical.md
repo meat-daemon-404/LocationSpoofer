@@ -9,9 +9,8 @@
 
 一句话结论：**抓到的从来不是 `isFromMockProvider`，而是同一个物理量在不同通道上对不上。**
 
-> 落地状态：§1、§2、§3、§4.1、§4.2、§4.3、§4.5、§4.6、§4.7、§4.8、§4.9、§4.10、§4.11、§4.12、§4.13、§4.14、§4.15、§5、§6 已全部实现，
-> 全量编译通过，`core-geo` 单元测试 106 项 + `xposed` 31 项全绿；只剩 §4.4 的一条已知边界未改
-> （基准海拔缺省值，需要产品决策）。
+> 落地状态：§1、§2、§3、§4.1、§4.2、§4.3、§4.4、§4.5、§4.6、§4.7、§4.8、§4.9、§4.10、§4.11、§4.12、§4.13、§4.14、§4.15、§5、§6 已全部实现，
+> 全量编译通过，`core-geo` 单元测试 115 项 + `xposed` 32 项全绿；已知边界都在各自小节末尾写明。
 > **已上机验证**（Android 15 x86_64 模拟器，LSPosed 注入目标进程、十五项改动在设备上被真实求值），
 > 过程中抓到并修掉两个只在真机暴露的 `Chain.args` 不可变问题，详见 §12；仍未走通的是「有 root 的端到端链路」。
 > 验证边界见文末「本次改动的验证边界」。
@@ -231,27 +230,65 @@ private val bootStepsBase: Double = 2350.0 + noiseRng.nextInt(2400).toDouble()
 
 同一进程内的接续语义不变（仍是单调递增、换会话接续），只是不再有任何跨账号可对齐的固定值。
 
-### 4.4 基准海拔的缺省值是 0（未改，需要产品决策）
+### 4.4 基准海拔的缺省值是 0（已实施：按坐标估一个地形高度）
 
-`SettingsManager.kt:129-131` 的 `altitude` 默认字符串是 `"0.0"`，`LocationRepository` 三处
-（`:121` / `:250` / `:293`）都是 `settingsManager.altitude.toDoubleOrNull() ?: 0.0`。
-于是**没手动填过海拔的用户，基准就是海平面 0 m**，再叠加 4.1 里的漂移之后可以落到负值：
+### 原状
+
+- `SettingsManager.kt:129-131` 的 `altitude` 默认字符串是 `"0.0"`，`LocationRepository` 三处
+  （`:121` / `:250` / `:293`）都是 `settingsManager.altitude.toDoubleOrNull() ?: 0.0`。
+- 于是**没手动填过海拔的用户，基准就是海平面 0 m**，再叠加 4.1 里的漂移之后可以落到负值：
 
 | 配置 | 实测最低值（30 分钟 @1 Hz） |
 |---|---|
 | MEDIUM 档、基准 0 | −1.529 m |
 | OFF 档（改前）、基准 0 | −7.198 m |
 
-内陆城市出现负海拔本身就是可判别的特征，而且"基准海拔集体为 0"和 4.1 里的常量问题属同一类：
-可跨账号聚合。**没有改的原因**是缺省值该填什么需要产品决策（按城市取近似高程？按最近一次
-真实定位高程？还是留空表示"未知、不上报"），随便换一个常量只是把一个指纹换成另一个。
+- 内陆城市出现负海拔本身就是可判别的特征，而且"基准海拔集体为 0"和 4.1 里的常量问题属同一类：可跨账号聚合。
+- `RouteEngine.realisticAltitude()` 在配置里没有 `altitude` 键时还会落到 `25.0`——又一个所有人共用的常量。
 
-顺带记一笔：静止派发时位置抖动是被关掉的（`LocationHooker` 里 `isStationary` 分支直接把
-配置坐标当输出），所以站着不动时位置是**精确等于**配置坐标的。对定位 App 来说这没问题，
-但如果目标 App 用加速度计/陀螺仪做"静止判定 + 位置应保持不变"的一致性检查，精确相等反而
-是异常的——真机静止时位置还有亚米级漂移。这一条没有改动，只是已知边界。
+### 改法
 
-### 4.5 卫星数是跨通道对不上的常量（已实施）
+不引任何高程数据表（那会把安装包与网络依赖都拖进来），用一个纯函数按坐标估：
+
+| 项 | 做法 |
+|---|---|
+| 场 | 三个尺度（约 7° / 1.9° / 0.45°）的正弦叠加 `sin(lng·k + φx) · cos(lat·0.7k + φy)`，权重 0.6 / 0.3 / 0.1 |
+| 分布 | 归一化到 `[0,1]` 后立方偏斜 `t³`，再映射到 `FLOOR_M(20 m) .. MAX_M(2000 m)` |
+| 量化 | 0.5 m，且夹进量程；非有限坐标返回下限 |
+| 一致性 | 纯函数，同一坐标任何时刻、任何进程都得到同一个值 |
+
+接入四处：`SettingsManager` 的缺省改成空串（空 = 按坐标自动）、`LocationRepository` 三处改为
+`resolveAltitude(settings, lat, lng)`、`RouteEngine.realisticAltitude()` 在没有 `altitude` 键时用
+`TerrainElevationModel.baselineMeters(pos.lat, pos.lng)`。
+
+为什么保留 20 m 的地面起点而不是直接 0：立方偏斜会把大量位置压到接近 0，叠加 0.5 m 量化后
+**很多人又都等于 0**——那只是把海平面常量换成另一个常量。
+
+### 实测（`TerrainElevationModel`，纯函数）
+
+```
+CITY 杭州       baseline=95.5 m
+CITY 北京       baseline=543.5 m
+CITY 深圳       baseline=287.0 m
+CITY 成都       baseline=210.0 m
+CITY 拉萨       baseline=66.5 m
+CITY 昆明       baseline=135.5 m
+CITY 上海       baseline=236.5 m
+CITY 乌鲁木齐   baseline=381.5 m
+GLOBAL n=2555 distinct=1260 min=23.5 p10=66.0 median=271.0 p90=746.0 max=1352.5   ZERO count=0
+NEARBY delta=0.010 deg diff=3.5 m        NEARBY delta=0.050 deg diff=12.0 m
+```
+
+⇒ 全球 5° 网格 2555 个点上 **1260 个不同取值、没有一个落到 0**；1.1 km 内只差 3.5 m（连续，不会
+"走两步海拔跳三百米"）。
+
+### 诚实边界
+
+- 这是"量级上说得过去"，不是真实高程：拉萨被估成 66 m 而实测 3650 m。真要精确，用户仍要在设置里自己填。
+- 只解决"全员同一个基准值"，不解决"和当地地形对不上"——后者需要真实 DEM 数据。
+- 顺带说明：静止派发时位置精确等于配置坐标这件事已单独在 §4.15 修掉。
+
+## 4.5 卫星数是跨通道对不上的常量（已实施）
 
 原状：卫星数在所有通道里都读同一个配置项 `config.optInt("satellite_count", 20)`，共 11 处；
 `BaiduMapHooker` 的三处 `setSatelliteNumber` 干脆硬编码 `20`，连配置都不看；
@@ -1071,17 +1108,17 @@ nextDispatchMs += dispatchPeriodMs
 | P2 | 静止时加速度计仍在输出步态波形 | `MotionRealism.accelerometer()` 的静止闸门 | `speed = 0` 时三轴只剩 `(0, 0, g)` | 已实施 |
 | P1 | 未校准三通道仍是真机读数，与改写后的校准通道减不出同一个值 | `SensorBiasModel` + `SensorStepHooker` | 未校准前三位减后三位逐位等于校准通道；零偏量级在真机器件区间内且随时间慢漂 | 已实施 |
 | P1 | 磁力计与旋转矢量仍是真机姿态，与改写后的重力/航向互相否定 | `GeomagneticModel` / `AttitudeModel` + `SensorStepHooker` | `rotateToDevice(q, 世界重力) == gravity`、磁力计反解航向 = 路线航向、`\|B\|` 不随航向变 | 已实施 |
-| P2 | 基准海拔缺省 0 导致全员海平面 | `SettingsManager.kt:129` / `LocationRepository` | 不出现跨账号的同一基准值 | 未改（需产品决策，见 §4.4） |
+| P1 | 基准海拔缺省 0 导致全员海平面、还能出负值 | `TerrainElevationModel` + `SettingsManager` / `LocationRepository` / `RouteEngine` | 全球网格无 0 值、不同城市基准不同、1.1 km 内变化 < 100 m | 已实施 |
 | P2 | 静止时位置逐位等于配置坐标 | `PositionJitter` + `RouteEngine.stationaryMotion()` | 静止 30 分钟内坐标取值不止一种、偏移半径 ≤ 2.2 m | 已实施 |
 
 ---
 
 ## 11. 本次改动的验证边界
 
-本仓库这一轮改了 21 项（§1、§2、§3、§4.1、§4.2、§4.3、§4.5 卫星数与天空几何、§4.6 气压计、
+本仓库这一轮改了 22 项（§1、§2、§3、§4.1、§4.2、§4.3、§4.5 卫星数与天空几何、§4.6 气压计、
 §4.7 MSL 海拔与垂直精度、§4.8 首个 fix 耗时、§4.9 NMEA 的 GSV/GSA、§4.10 陀螺仪、
 §4.11 步事件时刻、§4.12 重力与线性加速度、§4.13 磁力计与旋转矢量、§4.14 未校准三通道、
-§4.15 静止位置抖动、§5、§6、计步初值）。
+§4.15 静止位置抖动、§4.4 基准海拔按坐标估、§5、§6、计步初值）。
 这批改动里有**一次真正的上机运行**（§12：APK 装进 Android 15 模拟器、Xposed 注入目标进程成功），
 并且做到了**坐标这一项的端到端对照**（改配置即换城市，§12.6）；
 **运动学通道（加速度计 / 重力 / 线性加速度 / 陀螺仪）在路线模式跑动中读数自洽**（§12.6b：
@@ -1092,15 +1129,15 @@ nextDispatchMs += dispatchPeriodMs
 
 **① 全量编译（`core-geo` + `xposed`）**
 
-- 用 `kotlin-compiler-embeddable 2.0.0` 直接以命令行编译两个模块的全部 79 个 Kotlin 源文件
+- 用 `kotlin-compiler-embeddable 2.0.0` 直接以命令行编译两个模块的全部 80 个 Kotlin 源文件
   加 1 份 `BuildConfig` 桩（classpath = `android-34/android.jar` + libxposed API jar），
-  产出 386 个 class，**退出码 0、无错误**。
+  产出 387 个 class，**退出码 0、无错误**。
 - `core-geo` 用到的 `BuildConfig` 需要一份桩（真 BuildConfig 由 flavor 生成），
   桩只要 `const val GLOBAL_SCHEME: Boolean`。
 - `app-ui` / `core-data` / `service` 三个模块的 Compose、高德/百度 Maps 依赖在本机拿不到，
   没有本地编译；它们的编译由仓库的 `build` 工作流在 CI 上兜（`assembleScopedDebug`）。
 
-**② 单元测试（`core-geo` 16 个测试类、106 项 + `xposed` 5 个测试类、31 项）**
+**② 单元测试（`core-geo` 17 个测试类、115 项 + `xposed` 5 个测试类、32 项）**
 
 - 同样绕开 Gradle：编译 `core-geo/src/test` + JUnit 4.13.2 + hamcrest-core 1.3，
   用 `org.junit.runner.JUnitCore` 直接跑 → **OK (99 tests)**。
@@ -1213,6 +1250,8 @@ nextDispatchMs += dispatchPeriodMs
   原实现前 12 个间隔呈 `357, 285, 357, 357, 285, 357 …` 的三拍子，即跨派发边界的接缝。
 - 静止位置抖动：30 分钟 @1 Hz 共 1801 个点里出现 **1417 个不同坐标**（原实现只有 1 个）；
   半径最大 2.17 m、最小 0.05 m，相邻秒最大位移 0.49 m，20 个场次同刻偏移互不相同。
+- 基准海拔兜底：全球 5° 网格 2555 个点 **1260 个不同取值、0 个落在 0 米**（原实现全员 0）；
+  median 271 m、p90 746 m、max 1352 m；1.1 km 内差 3.5 m、5.5 km 内差 12 m。
 
 **⑩ 上机（模拟器：模块注入 + DEBUG 兜底 + 派发侧日志，详见 §12）**
 

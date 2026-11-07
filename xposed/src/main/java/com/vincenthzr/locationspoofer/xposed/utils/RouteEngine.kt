@@ -8,6 +8,7 @@ import com.vincenthzr.locationspoofer.utils.MotionRealism
 import com.vincenthzr.locationspoofer.utils.PositionJitter
 import com.vincenthzr.locationspoofer.utils.RoutePath
 import com.vincenthzr.locationspoofer.utils.SatelliteModel
+import com.vincenthzr.locationspoofer.utils.TerrainElevationModel
 import org.json.JSONArray
 import org.json.JSONObject
 
@@ -120,7 +121,14 @@ object RouteEngine {
      * 是用户显式要求固定海拔，仍原样返回基准值。
      */
     fun realisticAltitude(config: JSONObject, now: Long = System.currentTimeMillis()): Double {
-        val base = config.optDouble("altitude", 25.0)
+        // 配置里没写海拔（旧版配置或外部写入）时按坐标估一个地形高度，
+        // 不要再落回一个所有人共用的常量（旧值是 25.0）。
+        val base = if (config.has("altitude")) {
+            config.optDouble("altitude", 0.0)
+        } else {
+            val here = calculateCurrentPosition(config, now)
+            TerrainElevationModel.baselineMeters(here.lat, here.lng)
+        }
         val drift = MotionRealism.altitudeDriftM(
             MotionRealism.Level.fromId(config.optInt("realism_level", MotionRealism.Level.OFF.id))
         )

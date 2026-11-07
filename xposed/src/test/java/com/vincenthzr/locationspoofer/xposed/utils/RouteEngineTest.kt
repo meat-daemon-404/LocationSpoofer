@@ -4,6 +4,7 @@ import com.vincenthzr.locationspoofer.utils.BarometerModel
 import com.vincenthzr.locationspoofer.utils.CoordinateUtils.LatLng
 import com.vincenthzr.locationspoofer.utils.GeoMath
 import com.vincenthzr.locationspoofer.utils.PositionJitter
+import com.vincenthzr.locationspoofer.utils.TerrainElevationModel
 import org.json.JSONArray
 import org.json.JSONObject
 import org.junit.Assert.assertEquals
@@ -276,6 +277,22 @@ class RouteEngineTest {
             RouteEngine.realisticPressureHpa(cfg(start, variation = 0.0), now = start + it * 1000L)
         }
         assertTrue(fixed.max() - fixed.min() <= 1.0)
+    }
+
+    @Test
+    fun `missing altitude key falls back to the terrain baseline instead of a shared constant`() {
+        fun cfg(lat: Double, lng: Double) = JSONObject().apply {
+            put("is_route_mode", false)
+            put("lat", lat)
+            put("lng", lng)
+            // 关掉起伏，只比较基准值
+            put("altitude_variation_m", 0.0)
+        }
+        val here = RouteEngine.realisticAltitude(cfg(30.274085, 120.155070), now = 0L)
+        val far = RouteEngine.realisticAltitude(cfg(39.9042, 116.4074), now = 0L)
+        assertEquals(TerrainElevationModel.baselineMeters(30.274085, 120.155070), here, 1e-6)
+        assertTrue(here > 0.0)
+        assertTrue(here != far)
     }
 
     @Test

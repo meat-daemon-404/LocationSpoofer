@@ -1,5 +1,6 @@
 package com.vincenthzr.locationspoofer.data.repository
 
+import com.vincenthzr.locationspoofer.utils.TerrainElevationModel
 import android.content.Context
 import android.location.LocationManager
 import android.os.Build
@@ -118,7 +119,7 @@ class LocationRepository(
         // 导致"模拟一次后关闭再开就再也无法模拟"。
         rootManager.grantMockLocation()
 
-        val alt = settingsManager.altitude.toDoubleOrNull() ?: 0.0
+        val alt = resolveAltitude(settingsManager.altitude, lat, lng)
         val satCount = settingsManager.satelliteCount.toIntOrNull() ?: 20
         configManager.saveConfig(
             lat,
@@ -247,7 +248,7 @@ class LocationRepository(
         SpoofingState.cellJson = cellJson
         SpoofingState.bluetoothJson = bluetoothJson
         SpoofingState.enableJitter = enableJitter
-        val alt = settingsManager.altitude.toDoubleOrNull() ?: 0.0
+        val alt = resolveAltitude(settingsManager.altitude, lat, lng)
         val satCount = settingsManager.satelliteCount.toIntOrNull() ?: 20
         configManager.saveConfig(
             lat,
@@ -290,10 +291,24 @@ class LocationRepository(
             appCoordinateSystems = appCoordinateSystems,
             cellJson = SpoofingState.cellJson,
             bluetoothJson = SpoofingState.bluetoothJson,
-            altitude = settingsManager.altitude.toDoubleOrNull() ?: 0.0,
+            altitude = resolveAltitude(
+                settingsManager.altitude,
+                SpoofingState.latitude,
+                SpoofingState.longitude
+            ),
             satelliteCount = settingsManager.satelliteCount.toIntOrNull() ?: 20
         )
     }
+
+    /**
+     * 设置里填了就用填的；留空表示"按坐标自动估一个地形高度"。
+     *
+     * 为什么不再兜底成 0：旧版把没配过海拔的用户全部放在海平面，这是一个跨账号完全相同的量，
+     * 而且叠加变化范围后还能出负海拔。改由 [TerrainElevationModel] 按坐标给一个量级合理、
+     * 且同一地点永远一致的值。
+     */
+    private fun resolveAltitude(configured: String, lat: Double, lng: Double): Double =
+        configured.toDoubleOrNull() ?: TerrainElevationModel.baselineMeters(lat, lng)
 
     private fun routePointsToJson(points: List<RoutePoint>): String {
         val arr = JSONArray()

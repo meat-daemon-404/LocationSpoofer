@@ -25,6 +25,7 @@ import android.os.SystemClock
 import com.vincenthzr.locationspoofer.utils.GaitTemplate
 import com.vincenthzr.locationspoofer.utils.AttitudeModel
 import com.vincenthzr.locationspoofer.utils.GeomagneticModel
+import com.vincenthzr.locationspoofer.utils.SensorBiasModel
 import com.vincenthzr.locationspoofer.utils.GyroscopeModel
 import com.vincenthzr.locationspoofer.utils.StepEventTimeline
 import com.vincenthzr.locationspoofer.xposed.LocationHooker
@@ -74,6 +75,9 @@ object SensorStepHooker {
     private var mockLinearAccelSensor: Sensor? = null
     private var mockMagneticSensor: Sensor? = null
     private var mockRotationVectorSensor: Sensor? = null
+    private var mockGyroUncalibratedSensor: Sensor? = null
+    private var mockAccelUncalibratedSensor: Sensor? = null
+    private var mockMagneticUncalibratedSensor: Sensor? = null
     private var mockGameRotationSensor: Sensor? = null
 
     // 线性加速度要与同一时刻的加速度计同源；跨派发节拍的旧快照不如不要
@@ -239,6 +243,11 @@ object SensorStepHooker {
                                     applySyntheticRotationVector(values, config)
                                 }
                             }
+                        } else if (isUncalibratedSensorType(sensorType) && values.size >= 6) {
+                            // 未校准通道：系统保证"校准值 = 原始值 − 零偏"，只改校准侧会露馅
+                            if (uncalibratedEnabled(config, sensorType!!) && speed > 0.1) {
+                                applySyntheticUncalibrated(values, sensorType, config, speed)
+                            }
                         } else if (config.optBoolean("enable_step_simulation", true)) {
                             if (sensorType == Sensor.TYPE_STEP_COUNTER) {
                                 // 仅对明确判定的计步器传感器进行步数计算，严禁误判光感/距离传感器
@@ -273,7 +282,10 @@ object SensorStepHooker {
         mockLinearAccelSensor,
         mockMagneticSensor,
         mockRotationVectorSensor,
-        mockGameRotationSensor
+        mockGameRotationSensor,
+        mockGyroUncalibratedSensor,
+        mockAccelUncalibratedSensor,
+        mockMagneticUncalibratedSensor
     )
 
     internal fun clearReloadState() { capturedListeners.clear(); hookedListenerClasses.clear() }
@@ -299,6 +311,9 @@ object SensorStepHooker {
         mockMagneticSensor = state.getOrNull(11) as? Sensor
         mockRotationVectorSensor = state.getOrNull(12) as? Sensor
         mockGameRotationSensor = state.getOrNull(13) as? Sensor
+        mockGyroUncalibratedSensor = state.getOrNull(14) as? Sensor
+        mockAccelUncalibratedSensor = state.getOrNull(15) as? Sensor
+        mockMagneticUncalibratedSensor = state.getOrNull(16) as? Sensor
     }
 
     /**
@@ -339,7 +354,13 @@ object SensorStepHooker {
                                     }
                                     event.timestamp = SystemClock.elapsedRealtimeNanos()
                                 }
-                            } else if (isMagneticSensorType(event.sensor.type) && event.values.size >= 3) {
+                            } else if (isUncalibratedSensorType(event.sensor.type) && event.values.size >= 6) {
+                    // 未校准通道与校准通道必须减得出同一个值
+                    if (uncalibratedEnabled(config, event.sensor.type) && speed > 0.1) {
+                        applySyntheticUncalibrated(event.values, event.sensor.type, config, speed)
+                        event.timestamp = SystemClock.elapsedRealtimeNanos()
+                    }
+                } else if (isMagneticSensorType(event.sensor.type) && event.values.size >= 3) {
                                 // 同上：姿态类通道只在运动中改写，静止时真机读数本来就是对的
                                 if (magneticSimulationEnabled(config) && speed > 0.1) {
                                     if (event.sensor.type == Sensor.TYPE_MAGNETIC_FIELD) {
@@ -383,6 +404,16 @@ object SensorStepHooker {
         lastAccelSnapshotAtMs = now
     }
 
+    /** 取"当前这一刻"的加速度计读数：优先用刚生成的快照，过期就现算，保证跨通道同源 */
+    private fun currentAccelSnapshot(config: JSONObject, speed: Double, now: Long): FloatArray {
+        val snapshot = lastAccelSnapshot
+        return if (snapshot != null && now - lastAccelSnapshotAtMs in 0..ACCEL_SNAPSHOT_TTL_MS) {
+            snapshot
+        } else {
+            syntheticAcceleration(config, speed, now)
+        }
+    }
+
     /** 生成一份加速度计读数（含重力），坐标约定 X 左右、Y 前后、Z 竖直 */
     private fun syntheticAcceleration(config: JSONObject, speed: Double, now: Long): FloatArray {
         val stepsFloat = calculateCurrentStepsFloat(config, now)
@@ -405,12 +436,7 @@ object SensorStepHooker {
      */
     private fun applySyntheticLinearAcceleration(values: FloatArray, config: JSONObject, speed: Double) {
         val now = System.currentTimeMillis()
-        val snapshot = lastAccelSnapshot
-        val accel = if (snapshot != null && now - lastAccelSnapshotAtMs in 0..ACCEL_SNAPSHOT_TTL_MS) {
-            snapshot
-        } else {
-            syntheticAcceleration(config, speed, now)
-        }
+        val accel = currentAccelSnapshot(config, speed, now)
         val linear = RouteEngine.realismSession(config).linearAcceleration(accel)
         values[0] = linear[0]
         values[1] = linear[1]
@@ -436,19 +462,24 @@ object SensorStepHooker {
      * 真机在没有罗盘干扰时就是这样：应用把磁力计与 GPS 航向一对比，能看出"在跑却朝着固定方向"。
      */
     private fun applySyntheticMagneticField(values: FloatArray, config: JSONObject) {
+        val field = syntheticMagneticField(config)
+        values[0] = field[0]
+        values[1] = field[1]
+        values[2] = field[2]
+    }
+
+    /** 磁力计三轴：由当前纬度与航向按偶极模型推出来 */
+    private fun syntheticMagneticField(config: JSONObject): FloatArray {
         val now = System.currentTimeMillis()
         val position = RouteEngine.calculateCurrentPosition(config, now)
         val startTime = config.optLong("start_timestamp", now)
         val elapsedSec = (now - startTime).coerceAtLeast(0L) / 1000.0
-        val field = GeomagneticModel.sample(
+        return GeomagneticModel.sample(
             latitudeDeg = position.lat,
             headingDeg = position.bearing.toDouble(),
             seed = startTime,
             elapsedSec = elapsedSec
         )
-        values[0] = field[0]
-        values[1] = field[1]
-        values[2] = field[2]
     }
 
     /**
@@ -494,20 +525,76 @@ object SensorStepHooker {
      * 自己按高频补发既费力，又会和真实事件叠加出两条互不相干的序列。
      */
     private fun applySyntheticRotation(values: FloatArray, config: JSONObject, speed: Double) {
-        if (values.size < 3) return
+        val synthetic = syntheticRotation(config, speed)
+        values[0] = synthetic[0]
+        values[1] = synthetic[1]
+        values[2] = synthetic[2]
+    }
+
+    /** 陀螺仪三轴角速度：速度、步频、航向变化率三者共同决定 */
+    private fun syntheticRotation(config: JSONObject, speed: Double): FloatArray {
         val now = System.currentTimeMillis()
         val startTime = config.optLong("start_timestamp", now)
         val elapsedSec = (now - startTime).coerceAtLeast(0L) / 1000.0
-        val synthetic = GyroscopeModel.sample(
+        return GyroscopeModel.sample(
             speedMps = speed,
             cadenceSpm = currentCadence(config).toDouble(),
             headingRateRadPerSec = headingRateRadPerSec(config, now),
             seed = startTime,
             elapsedSec = elapsedSec
         )
-        values[0] = synthetic[0]
-        values[1] = synthetic[1]
-        values[2] = synthetic[2]
+    }
+
+    /**
+     * 未校准通道的三类传感器。它们每次给 6 个值：前三含零偏、后三零偏估计，
+     * 系统保证 `校准值 = 原始值 − 零偏`。只改校准通道会留下"减完对不上"的破绽。
+     */
+    private fun isUncalibratedSensorType(type: Int?): Boolean = when (type) {
+        Sensor.TYPE_GYROSCOPE_UNCALIBRATED,
+        Sensor.TYPE_ACCELEROMETER_UNCALIBRATED,
+        Sensor.TYPE_MAGNETIC_FIELD_UNCALIBRATED -> true
+        else -> false
+    }
+
+    /** 未校准通道跟着各自校准通道的开关走，不额外加配置项 */
+    private fun uncalibratedEnabled(config: JSONObject, sensorType: Int): Boolean = when (sensorType) {
+        Sensor.TYPE_GYROSCOPE_UNCALIBRATED -> gyroscopeEnabled(config)
+        Sensor.TYPE_ACCELEROMETER_UNCALIBRATED -> config.optBoolean("enable_step_simulation", true)
+        else -> magneticSimulationEnabled(config)
+    }
+
+    /** 写未校准读数：`原始 = 校准 + 零偏`，零偏写在后三位，减法回去与校准通道逐位相等 */
+    private fun applySyntheticUncalibrated(
+        values: FloatArray,
+        sensorType: Int,
+        config: JSONObject,
+        speed: Double
+    ) {
+        if (values.size < 6) return
+        val now = System.currentTimeMillis()
+        val startTime = config.optLong("start_timestamp", now)
+        val elapsedSec = (now - startTime).coerceAtLeast(0L) / 1000.0
+        val kind: SensorBiasModel.Kind
+        val calibrated: FloatArray
+        when (sensorType) {
+            Sensor.TYPE_GYROSCOPE_UNCALIBRATED -> {
+                kind = SensorBiasModel.Kind.GYROSCOPE
+                calibrated = syntheticRotation(config, speed)
+            }
+            Sensor.TYPE_ACCELEROMETER_UNCALIBRATED -> {
+                kind = SensorBiasModel.Kind.ACCELEROMETER
+                calibrated = currentAccelSnapshot(config, speed, now)
+            }
+            else -> {
+                kind = SensorBiasModel.Kind.MAGNETIC_FIELD
+                calibrated = syntheticMagneticField(config)
+            }
+        }
+        val bias = SensorBiasModel.bias(kind, startTime, elapsedSec)
+        for (axis in 0 until 3) {
+            values[axis] = calibrated[axis] + bias[axis]
+            values[axis + 3] = bias[axis]
+        }
     }
 
     /**
@@ -524,6 +611,10 @@ object SensorStepHooker {
         Sensor.TYPE_MAGNETIC_FIELD, Sensor.TYPE_ROTATION_VECTOR,
         Sensor.TYPE_GAME_ROTATION_VECTOR, Sensor.TYPE_GEOMAGNETIC_ROTATION_VECTOR ->
             magneticSimulationEnabled((XposedHelpers.module as? LocationHooker)?.readConfig())
+        // 未校准通道只改写真实事件、不注入虚拟实例：设备本来没有加速度计时凭空多出一个
+        // "未校准加速度计" 是新指纹，而且它对应的校准通道我们也没有注入
+        Sensor.TYPE_GYROSCOPE_UNCALIBRATED, Sensor.TYPE_ACCELEROMETER_UNCALIBRATED,
+        Sensor.TYPE_MAGNETIC_FIELD_UNCALIBRATED -> false
         else -> false
     }
 
@@ -534,6 +625,8 @@ object SensorStepHooker {
         Sensor.TYPE_GRAVITY, Sensor.TYPE_LINEAR_ACCELERATION -> true
         Sensor.TYPE_MAGNETIC_FIELD, Sensor.TYPE_ROTATION_VECTOR,
         Sensor.TYPE_GAME_ROTATION_VECTOR, Sensor.TYPE_GEOMAGNETIC_ROTATION_VECTOR -> true
+        Sensor.TYPE_GYROSCOPE_UNCALIBRATED, Sensor.TYPE_ACCELEROMETER_UNCALIBRATED,
+        Sensor.TYPE_MAGNETIC_FIELD_UNCALIBRATED -> true
         Sensor.TYPE_PRESSURE -> mockPressureSensor != null || barometerEnabled((XposedHelpers.module as? LocationHooker)?.readConfig())
         else -> false
     }
@@ -750,6 +843,9 @@ object SensorStepHooker {
         if (type == Sensor.TYPE_ROTATION_VECTOR && mockRotationVectorSensor != null) return mockRotationVectorSensor
         if (type == Sensor.TYPE_GAME_ROTATION_VECTOR && mockGameRotationSensor != null) return mockGameRotationSensor
         if (type == Sensor.TYPE_GEOMAGNETIC_ROTATION_VECTOR && mockRotationVectorSensor != null) return mockRotationVectorSensor
+        if (type == Sensor.TYPE_GYROSCOPE_UNCALIBRATED && mockGyroUncalibratedSensor != null) return mockGyroUncalibratedSensor
+        if (type == Sensor.TYPE_ACCELEROMETER_UNCALIBRATED && mockAccelUncalibratedSensor != null) return mockAccelUncalibratedSensor
+        if (type == Sensor.TYPE_MAGNETIC_FIELD_UNCALIBRATED && mockMagneticUncalibratedSensor != null) return mockMagneticUncalibratedSensor
 
         try {
             val sensorClass = Class.forName("android.hardware.Sensor", false, classLoader)
@@ -768,6 +864,9 @@ object SensorStepHooker {
                 Sensor.TYPE_ROTATION_VECTOR -> "Rotation Vector Sensor"
                 Sensor.TYPE_GAME_ROTATION_VECTOR -> "Game Rotation Vector Sensor"
                 Sensor.TYPE_GEOMAGNETIC_ROTATION_VECTOR -> "Geomagnetic Rotation Vector Sensor"
+                Sensor.TYPE_GYROSCOPE_UNCALIBRATED -> "Gyroscope Uncalibrated Sensor"
+                Sensor.TYPE_ACCELEROMETER_UNCALIBRATED -> "Accelerometer Uncalibrated Sensor"
+                Sensor.TYPE_MAGNETIC_FIELD_UNCALIBRATED -> "Magnetic Field Uncalibrated Sensor"
                 else -> "Accelerometer Sensor"
             })
             setSensorField(sensor, "mVendor", "Android")
@@ -784,6 +883,10 @@ object SensorStepHooker {
                     Sensor.TYPE_MAGNETIC_FIELD -> 0.15f
                     Sensor.TYPE_ROTATION_VECTOR, Sensor.TYPE_GAME_ROTATION_VECTOR,
                     Sensor.TYPE_GEOMAGNETIC_ROTATION_VECTOR -> 0.00001f
+                    // 未校准通道是同一颗器件的原始读数，分辨率与对应校准通道一致
+                    Sensor.TYPE_GYROSCOPE_UNCALIBRATED -> 0.001f
+                    Sensor.TYPE_ACCELEROMETER_UNCALIBRATED -> 0.0024f
+                    Sensor.TYPE_MAGNETIC_FIELD_UNCALIBRATED -> 0.15f
                     else -> 1.0f
                 }
             )
@@ -796,6 +899,9 @@ object SensorStepHooker {
                     Sensor.TYPE_MAGNETIC_FIELD -> 0.28f
                     Sensor.TYPE_ROTATION_VECTOR, Sensor.TYPE_GAME_ROTATION_VECTOR,
                     Sensor.TYPE_GEOMAGNETIC_ROTATION_VECTOR -> 0.175f
+                    Sensor.TYPE_GYROSCOPE_UNCALIBRATED -> 0.2f
+                    Sensor.TYPE_ACCELEROMETER_UNCALIBRATED -> 0.2f
+                    Sensor.TYPE_MAGNETIC_FIELD_UNCALIBRATED -> 0.28f
                     else -> 0.05f
                 }
             )
@@ -811,6 +917,9 @@ object SensorStepHooker {
                 Sensor.TYPE_ROTATION_VECTOR -> mockRotationVectorSensor = sensor
                 Sensor.TYPE_GAME_ROTATION_VECTOR -> mockGameRotationSensor = sensor
                 Sensor.TYPE_GEOMAGNETIC_ROTATION_VECTOR -> mockRotationVectorSensor = sensor
+                Sensor.TYPE_GYROSCOPE_UNCALIBRATED -> mockGyroUncalibratedSensor = sensor
+                Sensor.TYPE_ACCELEROMETER_UNCALIBRATED -> mockAccelUncalibratedSensor = sensor
+                Sensor.TYPE_MAGNETIC_FIELD_UNCALIBRATED -> mockMagneticUncalibratedSensor = sensor
             }
             return sensor
         } catch (_: Throwable) {

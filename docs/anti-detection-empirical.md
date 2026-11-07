@@ -9,8 +9,8 @@
 
 一句话结论：**抓到的从来不是 `isFromMockProvider`，而是同一个物理量在不同通道上对不上。**
 
-> 落地状态：§1、§2、§3、§4.1、§4.2、§4.3、§4.5、§4.6、§4.7、§4.8、§4.9、§4.10、§4.11、§4.12、§4.13、§5、§6 已全部实现，
-> 全量编译通过，`core-geo` 单元测试 92 项 + `xposed` 29 项全绿；另有 §4.4 两条已知边界未改
+> 落地状态：§1、§2、§3、§4.1、§4.2、§4.3、§4.5、§4.6、§4.7、§4.8、§4.9、§4.10、§4.11、§4.12、§4.13、§4.14、§5、§6 已全部实现，
+> 全量编译通过，`core-geo` 单元测试 99 项 + `xposed` 29 项全绿；另有 §4.4 两条已知边界未改
 > （基准海拔缺省值与静止位置精确，都需要产品决策）。
 > **已上机验证**（Android 15 x86_64 模拟器，LSPosed 注入目标进程、十五项改动在设备上被真实求值），
 > 过程中抓到并修掉两个只在真机暴露的 `Chain.args` 不可变问题，详见 §12；仍未走通的是「有 root 的端到端链路」。
@@ -829,6 +829,63 @@ DRIFT t=0..3000s: -21.324/20.850/-35.172 → -21.028/21.126/-33.977
 
 ---
 
+## 4.14 未校准（uncalibrated）三通道仍是真机读数（已实施）
+
+### 原状
+
+`TYPE_GYROSCOPE_UNCALIBRATED`（16）/ `TYPE_ACCELEROMETER_UNCALIBRATED`（35）/
+`TYPE_MAGNETIC_FIELD_UNCALIBRATED`（14）每次给 **6 个值**：前三个是**含零偏的原始读数**，
+后三个是器件自己估出来的零偏。Android 对这三条通道有一个明确契约：
+
+```
+校准值 ≡ 原始值 − 零偏
+```
+
+改完 §4.10 与 §4.13 之后，校准通道已经被我们接管，而未校准通道还是真机读数。
+应用只要把未校准的前三个值减掉后三个，就会得到一条**真机原始曲线**，
+它与我们给的校准曲线完全对不上——同一颗器件、同一时刻，两条曲线一个在跑一个静止。
+这比"某个通道没做"更容易被判：**不是缺数据，而是同一台设备自相矛盾**。
+
+### 改法：给零偏一个像真机器的量级，再让差值反过来等于校准通道
+
+新增 `core-geo/.../SensorBiasModel.kt`：
+
+| 通道 | 零偏幅度上限 | 真机常见范围 |
+|---|---|---|
+| 陀螺 | `0.02 rad/s` | 0.01 ~ 0.05（常温 MEMS） |
+| 加速度计 | `0.06 m/s²` | 0.02 ~ 0.1 |
+| 磁力计 | `1.1 µT` | 0.5 ~ 3（硬铁干扰） |
+
+- 零偏不是常量：三条通道各三个轴，每个轴一个 `MotionRealism.SmoothNoise`，
+  周期取 `240 ~ 1200 s`（真机器件零偏跟温度走，是分钟到十分钟量级），
+  三轴相位彼此错开 `37 s`，避免三轴同步摆动。
+- 写入规则：`values[i] = 校准值[i] + 零偏[i]`、`values[i+3] = 零偏[i]`（`i ∈ 0..2`）。
+  于是应用做减法**逐位回到校准通道**，契约成立。
+- 校准值不是重新采一份，而是复用同一时刻的合成值：陀螺走 `syntheticRotation()`、
+  加速度计走 `currentAccelSnapshot()`（200 ms 内复用快照）、磁力计走 `syntheticMagneticField()`。
+  跨通道同源这件事，和 §4.12 的三通道恒等式是同一个要求。
+- 开关沿用各自校准通道的：陀螺看 `gyroscope_simulation`、加速度计看 `enable_step_simulation`、
+  磁力计看 `magnetic_simulation`，不新增配置项——多一个开关就多一种"用户配错导致两路不一致"的状态。
+- **不注入虚拟传感器**：设备本来没有加速度计时凭空多出一个"未校准加速度计"本身就是新指纹，
+  而且它对应的校准通道我们也没注入。只改写真实事件。
+
+### 实测（单测，`core-geo` 99 项里的 7 项）
+
+- 三种通道各扫 1 小时（30 秒步进），**每个轴都不超出上表的幅度上限**；
+- 1 小时内零偏确实在变（`varies()` 为真），不是常量；
+- 1 秒内单轴变化 ≤ 幅度上限的 5%——真机器件不会瞬跳；
+- 同场次同刻重复取值完全相等，不同场次不同；负的 `elapsedSec` 被夹到 0 而不是外推。
+
+### 诚实边界
+
+* 零偏是"像真机器件的量级"，不是某颗真实器件的标定值；应用若拿它和真实的
+  长期统计比对，仍可能看出分布不对（但要看很久）。
+* 没做温度依赖：真机器件零偏随温度漂移，这里是纯时间函数。
+* 未校准磁力计的零偏在真机上主要是硬铁偏移（跟随安装位置），这里给了个各向同性的慢漂移。
+* 同样只改写运动中的读数，静止时这三条通道仍是真机值。
+
+---
+
 ## 5. 精度：原范围偏乐观（已实施：放宽基准，加慢变分量）
 
 原 `getJitteredAccuracy()` 用 OU 式游走 `(2.2 + drift).coerceIn(1.5, 3.5)`，恒定有起伏，
@@ -951,6 +1008,7 @@ nextDispatchMs += dispatchPeriodMs
 | P2 | 步事件时刻按周期等间隔回推，跨派发边界有接缝 | `StepEventTimeline` + `SensorStepHooker` | 恒定步频下相邻间隔极差 < 20 ms（原实现 357 ms） | 已实施 |
 | P1 | 重力 / 线性加速度通道仍是真机读数，与改写后的加速度计互不自洽 | `MotionRealism.Session.gravity()` / `linearAcceleration()` + `SensorStepHooker` | `linear == accel − gravity` 恒成立；静止时加速度计只剩重力、线性加速度≈0 | 已实施 |
 | P2 | 静止时加速度计仍在输出步态波形 | `MotionRealism.accelerometer()` 的静止闸门 | `speed = 0` 时三轴只剩 `(0, 0, g)` | 已实施 |
+| P1 | 未校准三通道仍是真机读数，与改写后的校准通道减不出同一个值 | `SensorBiasModel` + `SensorStepHooker` | 未校准前三位减后三位逐位等于校准通道；零偏量级在真机器件区间内且随时间慢漂 | 已实施 |
 | P1 | 磁力计与旋转矢量仍是真机姿态，与改写后的重力/航向互相否定 | `GeomagneticModel` / `AttitudeModel` + `SensorStepHooker` | `rotateToDevice(q, 世界重力) == gravity`、磁力计反解航向 = 路线航向、`\|B\|` 不随航向变 | 已实施 |
 | P2 | 基准海拔缺省 0 导致全员海平面 | `SettingsManager.kt:129` / `LocationRepository` | 不出现跨账号的同一基准值 | 未改（需产品决策，见 §4.4） |
 | P2 | 静止时位置精确等于配置坐标 | `LocationHooker` `isStationary` 分支 | 静止时仍有亚米级漂移 | 未改（见 §4.4） |
@@ -959,9 +1017,10 @@ nextDispatchMs += dispatchPeriodMs
 
 ## 11. 本次改动的验证边界
 
-本仓库这一轮改了 19 项（§1、§2、§3、§4.1、§4.2、§4.3、§4.5 卫星数与天空几何、§4.6 气压计、
+本仓库这一轮改了 20 项（§1、§2、§3、§4.1、§4.2、§4.3、§4.5 卫星数与天空几何、§4.6 气压计、
 §4.7 MSL 海拔与垂直精度、§4.8 首个 fix 耗时、§4.9 NMEA 的 GSV/GSA、§4.10 陀螺仪、
-§4.11 步事件时刻、§4.12 重力与线性加速度、§4.13 磁力计与旋转矢量、§5、§6、计步初值）。
+§4.11 步事件时刻、§4.12 重力与线性加速度、§4.13 磁力计与旋转矢量、§4.14 未校准三通道、
+§5、§6、计步初值）。
 这批改动里有**一次真正的上机运行**（§12：APK 装进 Android 15 模拟器、Xposed 注入目标进程成功），
 并且做到了**坐标这一项的端到端对照**（改配置即换城市，§12.6）；
 **运动学通道（加速度计 / 重力 / 线性加速度 / 陀螺仪）在路线模式跑动中读数自洽**（§12.6b：
@@ -972,18 +1031,18 @@ nextDispatchMs += dispatchPeriodMs
 
 **① 全量编译（`core-geo` + `xposed`）**
 
-- 用 `kotlin-compiler-embeddable 2.0.0` 直接以命令行编译两个模块的全部 75 个 Kotlin 源文件
+- 用 `kotlin-compiler-embeddable 2.0.0` 直接以命令行编译两个模块的全部 78 个 Kotlin 源文件
   加 1 份 `BuildConfig` 桩（classpath = `android-34/android.jar` + libxposed API jar），
-  产出 378 个 class，**退出码 0、无错误**。
+  产出 384 个 class，**退出码 0、无错误**。
 - `core-geo` 用到的 `BuildConfig` 需要一份桩（真 BuildConfig 由 flavor 生成），
   桩只要 `const val GLOBAL_SCHEME: Boolean`。
 - `app-ui` / `core-data` / `service` 三个模块的 Compose、高德/百度 Maps 依赖在本机拿不到，
   没有本地编译；它们的编译由仓库的 `build` 工作流在 CI 上兜（`assembleScopedDebug`）。
 
-**② 单元测试（`core-geo` 14 个测试类、92 项 + `xposed` 5 个测试类、29 项）**
+**② 单元测试（`core-geo` 15 个测试类、99 项 + `xposed` 5 个测试类、29 项）**
 
 - 同样绕开 Gradle：编译 `core-geo/src/test` + JUnit 4.13.2 + hamcrest-core 1.3，
-  用 `org.junit.runner.JUnitCore` 直接跑 → **OK (92 tests)**。
+  用 `org.junit.runner.JUnitCore` 直接跑 → **OK (99 tests)**。
 - `xposed` 侧同样方式跑 `RouteEngineTest` / `HotReloadHostTest` / `VendorRegistryTest` /
   `ColorOs16VendorTest` / `LocationAltitudeMetadataTest` → **OK (29 tests)**，其中包含两条既有断言：
   显式 `altitude_variation_m = 0` 时海拔恒为基准值（`assertEquals(80.0, …, 0.0)`），
@@ -1013,6 +1072,9 @@ nextDispatchMs += dispatchPeriodMs
   大跳变只保留最近 8 步、超期事件丢弃、`reset`、恒定步频下 20 秒正好 54 步且相邻间隔 370 ms±3 ms）。
 - §4.12 的重力 / 线性加速度有 4 项单测：重力向量模长标准、`linear` 逐轴等于 `accel - gravity`
   （4000 点）、整段上 `linear` 零均值而 `accel` 均值等于重力、静止时加速度计只剩 `(0, 0, g)`。
+- §4.14 的未校准零偏有 7 项单测：三条通道各扫一小时都不越界、一小时内确实在漂、
+  一秒内变化不超过上限的 5%、同场次同刻恒定、不同场次不同、三种量级互不混用、
+  负 `elapsedSec` 夹到 0 而不外推。
 
 **③ 自建测量用例（bearing 差分）**
 
